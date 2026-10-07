@@ -1,7 +1,7 @@
 # Sylphy
 
 [![CI](https://github.com/nima-ca/sylphy/actions/workflows/ci.yml/badge.svg)](https://github.com/nima-ca/sylphy/actions/workflows/ci.yml)
-![Go version](https://img.shields.io/badge/go-1.27%2B-00ADD8?logo=go)
+![Go version](https://img.shields.io/badge/go-1.24%2B-00ADD8?logo=go)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 Sylphy is a Redis-compatible in-memory database written in Go using only the
