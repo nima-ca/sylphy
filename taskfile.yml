@@ -1,0 +1,77 @@
+version: "3"
+
+vars:
+    BINARY: sylphy-server
+    VERSION:
+        sh: git describe --tags --always --dirty 2>/dev/null || echo dev
+    COMMIT:
+        sh: git rev-parse --short HEAD 2>/dev/null || echo none
+    DATE: '{{dateInZone "2006-01-02T15:04:05Z" now "UTC"}}'
+    LDFLAGS: -s -w -X main.version={{.VERSION}} -X main.commit={{.COMMIT}} -X main.date={{.DATE}}
+
+tasks:
+    default:
+        desc: List available tasks
+        cmds:
+            - task --list
+        silent: true
+
+    tools:
+        desc: Install golangci-lint
+        cmds:
+            - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+
+    build:
+        desc: Build bin/sylphy-server with version info
+        cmds:
+            - go build -trimpath -ldflags "{{.LDFLAGS}}" -o bin/{{.BINARY}}{{exeExt}} ./cmd/sylphy-server
+
+    run:
+        desc: Run the server (pass flags after --, e.g. task run -- -addr :7000)
+        cmds:
+            - go run ./cmd/sylphy-server {{.CLI_ARGS}}
+
+    test:
+        desc: Run all tests
+        cmds:
+            - go test ./...
+
+    test-race:
+        desc: Run all tests with the race detector (needs cgo/gcc on Windows)
+        cmds:
+            - go test -race ./...
+
+    cover:
+        desc: Run tests with coverage
+        cmds:
+            - go test -race -cover -coverprofile=coverage.out ./...
+            - go tool cover -func=coverage.out
+
+    lint:
+        desc: go vet + golangci-lint
+        cmds:
+            - go vet ./...
+            - golangci-lint run ./...
+
+    fuzz:
+        desc: Short protocol fuzz run
+        cmds:
+            - go test ./internal/protocol -run '^$' -fuzz FuzzReader -fuzztime 20s
+
+    bench:
+        desc: Run benchmarks
+        cmds:
+            - go test -run '^$' -bench . -benchmem ./internal/protocol ./internal/store
+
+    docker:
+        desc: Build the Docker image
+        cmds:
+            - docker build --build-arg VERSION={{.VERSION}} --build-arg COMMIT={{.COMMIT}} --build-arg DATE={{.DATE}} -t sylphy:{{.VERSION}} .
+
+    clean:
+        desc: Remove build artifacts
+        cmds:
+            - cmd: rm -rf bin coverage.out
+              platforms: [linux, darwin]
+            - cmd: powershell -NoProfile -Command "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue bin, coverage.out"
+              platforms: [windows]
