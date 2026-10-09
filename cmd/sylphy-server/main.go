@@ -45,11 +45,27 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 	}
 
 	logger := newLogger(cfg, stderr)
-	st, err := store.New(cfg.Shards)
+	st, err := store.NewWithOptions(store.Options{
+		Shards: cfg.Shards,
+		Sweep: store.SweepConfig{
+			TickInterval:   cfg.ExpireTickInterval,
+			SampleSize:     cfg.ExpireSampleSize,
+			CycleBudget:    cfg.ExpireCycleBudget,
+			StaleThreshold: cfg.ExpireStaleThreshold,
+		},
+	})
+
 	if err != nil {
 		logger.Error("creating store", "err", err)
 		return 1
 	}
+
+	// The store owns the expiry sweeper goroutine. Close runs on every return
+	// path, i.e. after ListenAndServe has drained clients, so the sweeper never
+	// outlives the server.
+	st.Start()
+	defer st.Close()
+
 	reg, err := command.NewDefaultRegistry()
 	if err != nil {
 		logger.Error("building command registry", "err", err)
@@ -62,7 +78,9 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 
 	logger.Info("sylphy starting",
 		"version", version, "commit", commit, "built", date,
-		"addr", cfg.Addr, "shards", cfg.Shards)
+		"addr", cfg.Addr, "shards", cfg.Shards,
+		"expire_tick", cfg.ExpireTickInterval, "expire_sample", cfg.ExpireSampleSize,
+		"expire_budget", cfg.ExpireCycleBudget, "expire_stale", cfg.ExpireStaleThreshold)
 
 	err = srv.ListenAndServe(ctx)
 	switch {

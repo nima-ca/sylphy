@@ -30,6 +30,16 @@ type Config struct {
 	LogLevel string
 	// LogFormat is text or json.
 	LogFormat string
+	// ExpireTickInterval is the time between active-expiry sweeper cycles.
+	ExpireTickInterval time.Duration
+	// ExpireSampleSize is how many expiring keys the sweeper examines per
+	// shard per batch.
+	ExpireSampleSize int
+	// ExpireCycleBudget caps the real time one sweeper cycle may spend.
+	ExpireCycleBudget time.Duration
+	// ExpireStaleThreshold is the expired fraction of a batch, in [0, 1),
+	// above which the sweeper samples the same shard again.
+	ExpireStaleThreshold float64
 	// MaxBulkLen, MaxArrayLen, MaxInlineLen and MaxDepth bound RESP parsing.
 	MaxBulkLen   int64
 	MaxArrayLen  int64
@@ -48,10 +58,16 @@ func Default() Config {
 		ShutdownGracePeriod: 10 * time.Second,
 		LogLevel:            "info",
 		LogFormat:           "text",
-		MaxBulkLen:          l.MaxBulkLen,
-		MaxArrayLen:         l.MaxArrayLen,
-		MaxInlineLen:        l.MaxInlineLen,
-		MaxDepth:            l.MaxDepth,
+		// Sweeper defaults mirror store.DefaultSweepConfig (a test keeps them
+		// in sync); config avoids importing store.
+		ExpireTickInterval:   100 * time.Millisecond,
+		ExpireSampleSize:     20,
+		ExpireCycleBudget:    25 * time.Millisecond,
+		ExpireStaleThreshold: 0.25,
+		MaxBulkLen:           l.MaxBulkLen,
+		MaxArrayLen:          l.MaxArrayLen,
+		MaxInlineLen:         l.MaxInlineLen,
+		MaxDepth:             l.MaxDepth,
 	}
 }
 
@@ -99,19 +115,35 @@ func (c Config) Validate() error {
 	if c.ShutdownGracePeriod < 0 {
 		add("shutdown-grace-period must not be negative, got %v", c.ShutdownGracePeriod)
 	}
+
 	switch c.LogLevel {
 	case "debug", "info", "warn", "error":
 	default:
 		add("log-level must be debug, info, warn or error, got %q", c.LogLevel)
 	}
+
 	switch c.LogFormat {
 	case "text", "json":
 	default:
 		add("log-format must be text or json, got %q", c.LogFormat)
 	}
+
+	if c.ExpireTickInterval <= 0 {
+		add("expire-tick-interval must be positive, got %v", c.ExpireTickInterval)
+	}
+	if c.ExpireSampleSize <= 0 {
+		add("expire-sample-size must be positive, got %d", c.ExpireSampleSize)
+	}
+	if c.ExpireCycleBudget <= 0 {
+		add("expire-cycle-budget must be positive, got %v", c.ExpireCycleBudget)
+	}
+	if !(c.ExpireStaleThreshold >= 0 && c.ExpireStaleThreshold < 1) { // also rejects NaN
+		add("expire-stale-threshold must be in [0, 1), got %v", c.ExpireStaleThreshold)
+	}
 	if c.MaxBulkLen <= 0 || c.MaxArrayLen <= 0 || c.MaxInlineLen <= 0 || c.MaxDepth <= 0 {
 		add("protocol limits (max-bulk-len, max-array-len, max-inline-len, max-depth) must be positive")
 	}
+
 	return errors.Join(errs...)
 }
 
@@ -133,6 +165,10 @@ func Load(args []string, getenv func(string) string, out io.Writer) (Config, err
 	fs.DurationVar(&cfg.ShutdownGracePeriod, "shutdown-grace-period", cfg.ShutdownGracePeriod, "graceful shutdown deadline (env SYLPHY_SHUTDOWN_GRACE_PERIOD)")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "debug|info|warn|error (env SYLPHY_LOG_LEVEL)")
 	fs.StringVar(&cfg.LogFormat, "log-format", cfg.LogFormat, "text|json (env SYLPHY_LOG_FORMAT)")
+	fs.DurationVar(&cfg.ExpireTickInterval, "expire-tick-interval", cfg.ExpireTickInterval, "active expiry cycle interval (env SYLPHY_EXPIRE_TICK_INTERVAL)")
+	fs.IntVar(&cfg.ExpireSampleSize, "expire-sample-size", cfg.ExpireSampleSize, "expiring keys sampled per shard per batch (env SYLPHY_EXPIRE_SAMPLE_SIZE)")
+	fs.DurationVar(&cfg.ExpireCycleBudget, "expire-cycle-budget", cfg.ExpireCycleBudget, "max time one expiry cycle may run (env SYLPHY_EXPIRE_CYCLE_BUDGET)")
+	fs.Float64Var(&cfg.ExpireStaleThreshold, "expire-stale-threshold", cfg.ExpireStaleThreshold, "expired fraction in [0,1) that triggers another sample (env SYLPHY_EXPIRE_STALE_THRESHOLD)")
 	fs.Int64Var(&cfg.MaxBulkLen, "max-bulk-len", cfg.MaxBulkLen, "max bulk string bytes (env SYLPHY_MAX_BULK_LEN)")
 	fs.Int64Var(&cfg.MaxArrayLen, "max-array-len", cfg.MaxArrayLen, "max array elements (env SYLPHY_MAX_ARRAY_LEN)")
 	fs.IntVar(&cfg.MaxInlineLen, "max-inline-len", cfg.MaxInlineLen, "max inline line bytes (env SYLPHY_MAX_INLINE_LEN)")
@@ -175,6 +211,9 @@ func applyEnv(cfg *Config, getenv func(string) string) error {
 	int64Var := func(name string, dst *int64) {
 		parse(name, func(v string) (err error) { *dst, err = strconv.ParseInt(v, 10, 64); return })
 	}
+	floatVar := func(name string, dst *float64) {
+		parse(name, func(v string) (err error) { *dst, err = strconv.ParseFloat(v, 64); return })
+	}
 	durVar := func(name string, dst *time.Duration) {
 		parse(name, func(v string) (err error) { *dst, err = time.ParseDuration(v); return })
 	}
@@ -190,5 +229,9 @@ func applyEnv(cfg *Config, getenv func(string) string) error {
 	int64Var("SYLPHY_MAX_ARRAY_LEN", &cfg.MaxArrayLen)
 	durVar("SYLPHY_IDLE_TIMEOUT", &cfg.IdleTimeout)
 	durVar("SYLPHY_SHUTDOWN_GRACE_PERIOD", &cfg.ShutdownGracePeriod)
+	durVar("SYLPHY_EXPIRE_TICK_INTERVAL", &cfg.ExpireTickInterval)
+	durVar("SYLPHY_EXPIRE_CYCLE_BUDGET", &cfg.ExpireCycleBudget)
+	intVar("SYLPHY_EXPIRE_SAMPLE_SIZE", &cfg.ExpireSampleSize)
+	floatVar("SYLPHY_EXPIRE_STALE_THRESHOLD", &cfg.ExpireStaleThreshold)
 	return errors.Join(errs...)
 }

@@ -21,9 +21,22 @@ var (
 	ErrOverflow = &ReplyError{Msg: "ERR increment or decrement would overflow"}
 	// ErrSyntax is returned for unsupported or malformed options.
 	ErrSyntax = &ReplyError{Msg: "ERR syntax error"}
+	// ErrNotFloat is returned when a value is not a valid float.
+	ErrNotFloat = &ReplyError{Msg: "ERR value is not a valid float"}
+	// ErrMustBePositive is returned when a count or size must be positive.
+	ErrMustBePositive = &ReplyError{Msg: "ERR value is out of range, must be positive"}
+	// ErrWrongType is sent when a command meets a key of the wrong kind. The
+	// dispatcher maps store.ErrWrongType to it.
+	ErrWrongType = &ReplyError{Msg: "WRONGTYPE Operation against a key holding the wrong kind of value"}
 )
 
 // WrongArgs builds the "wrong number of arguments" error for a command name.
 func WrongArgs(name string) *ReplyError {
 	return &ReplyError{Msg: "ERR wrong number of arguments for '" + strings.ToLower(name) + "' command"}
+}
+
+// InvalidExpireTime builds the error for an unusable TTL or deadline. name is
+// the command name in any case.
+func InvalidExpireTime(name string) *ReplyError {
+	return &ReplyError{Msg: "ERR invalid expire time in '" + strings.ToLower(name) + "' command"}
 }

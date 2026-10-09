@@ -2,65 +2,27 @@ package command
 
 import (
 	"bytes"
-	"sort"
 	"testing"
 
 	"github.com/nima-ca/sylphy/internal/config"
 	"github.com/nima-ca/sylphy/internal/protocol"
+	"github.com/nima-ca/sylphy/internal/store"
 )
 
-// fakeStore is a minimal single-threaded Store for handler tests.
-type fakeStore struct{ m map[string][]byte }
+// fakeStore is the Store used by handler tests: a real store
+// driven by a FakeClock. A hand-written map fake cannot implement MutateEntry,
+// because store.Entry cannot be constructed outside its package.
+type fakeStore struct{ *store.Store }
 
-func (f *fakeStore) Get(k string) ([]byte, bool) {
-	v, ok := f.m[k]
-	return append([]byte(nil), v...), ok
-}
-func (f *fakeStore) Set(k string, v []byte) { f.m[k] = append([]byte{}, v...) }
-func (f *fakeStore) Delete(keys ...string) int {
-	n := 0
-	for _, k := range keys {
-		if _, ok := f.m[k]; ok {
-			delete(f.m, k)
-			n++
-		}
-	}
-	return n
-}
-func (f *fakeStore) Exists(keys ...string) int {
-	n := 0
-	for _, k := range keys {
-		if _, ok := f.m[k]; ok {
-			n++
-		}
-	}
-	return n
-}
-func (f *fakeStore) Len() int { return len(f.m) }
-func (f *fakeStore) Flush()   { f.m = map[string][]byte{} }
-func (f *fakeStore) Keys(string) []string {
-	var out []string
-	for k := range f.m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-func (f *fakeStore) Update(k string, fn func([]byte, bool) ([]byte, error)) error {
-	old, ok := f.m[k]
-	nv, err := fn(append([]byte(nil), old...), ok)
-	if err != nil {
-		return err
-	}
-	f.m[k] = nv
-	return nil
-}
+// testEpochMs is the fake clock's starting time: a round, plausible Unix ms.
+const testEpochMs = 1_700_000_000_000
 
 type harness struct {
 	d   *Dispatcher
 	ctx *Context
 	buf *bytes.Buffer
 	w   *protocol.Writer
+	clk *store.FakeClock
 }
 
 func newHarness(t *testing.T) *harness {
@@ -72,11 +34,17 @@ func newHarness(t *testing.T) *harness {
 	buf := &bytes.Buffer{}
 	w := protocol.NewWriter(buf)
 	cfg := config.Default()
+	clk := store.NewFakeClock(testEpochMs)
+	st, err := store.NewWithOptions(store.Options{Shards: 4, Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &harness{
 		d:   NewDispatcher(reg, nil),
-		ctx: &Context{Store: &fakeStore{m: map[string][]byte{}}, W: w, Config: &cfg, Conn: &ConnState{ID: 1}},
+		ctx: &Context{Store: &fakeStore{st}, W: w, Config: &cfg, Conn: &ConnState{ID: 1}},
 		buf: buf,
 		w:   w,
+		clk: clk,
 	}
 }
 
@@ -109,7 +77,7 @@ func TestCommandsSequence(t *testing.T) {
 		{[]string{"ECHO"}, "-ERR wrong number of arguments for 'echo' command\r\n"},
 		{[]string{"SET", "k", "v"}, "+OK\r\n"},
 		{[]string{"SET", "k"}, "-ERR wrong number of arguments for 'set' command\r\n"},
-		{[]string{"SET", "k", "v", "EX", "10"}, syntax},
+		{[]string{"SET", "k", "v", "BOGUS"}, syntax},
 		{[]string{"get", "k"}, "$1\r\nv\r\n"},
 		{[]string{"GET", "nope"}, "$-1\r\n"},
 		{[]string{"GET"}, "-ERR wrong number of arguments for 'get' command\r\n"},

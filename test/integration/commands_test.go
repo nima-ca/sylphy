@@ -89,7 +89,7 @@ func TestErrorReplies(t *testing.T) {
 		{"incr overflow", c.Incr(ctx, "big").Err(), "increment or decrement would overflow"},
 		{"wrong arity", c.Do(ctx, "GET").Err(), "wrong number of arguments for 'get' command"},
 		{"unknown command", c.Do(ctx, "FOO", "bar").Err(), "unknown command 'FOO', with args beginning with: 'bar'"},
-		{"set option", c.Do(ctx, "SET", "k", "v", "EX", "5").Err(), "syntax error"},
+		{"set option", c.Do(ctx, "SET", "k", "v", "BOGUS").Err(), "syntax error"},
 		{"select 1", c.Do(ctx, "SELECT", "1").Err(), "DB index is out of range"},
 	}
 	for _, tt := range tests {

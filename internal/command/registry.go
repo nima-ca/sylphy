@@ -30,8 +30,71 @@ type Spec struct {
 	Arity int
 	// Flags carries command properties.
 	Flags Flags
+	// FirstKey, LastKey and Step locate the key arguments the way Redis does.
+	// Positions count the command name as 0, so a command whose first
+	// argument is a key has FirstKey 1. A negative LastKey counts from the end
+	// (-1 is the last argument). Step is the distance between keys (2 for
+	// MSET's key/value pairs). FirstKey 0 means the command takes no keys, and
+	// then LastKey and Step must be 0.
+	FirstKey, LastKey, Step int
 	// Handler runs the command.
 	Handler Handler
+}
+
+// Keys returns the key arguments of argv (command name first) according to the
+// spec's key positions, without copying. It tolerates short argv.
+func (sp *Spec) Keys(argv [][]byte) [][]byte {
+	if sp.FirstKey == 0 {
+		return nil
+	}
+	last := sp.LastKey
+	if last < 0 {
+		last += len(argv)
+	}
+	last = min(last, len(argv)-1)
+	var out [][]byte
+	for i := sp.FirstKey; i <= last; i += sp.Step {
+		out = append(out, argv[i])
+	}
+	return out
+}
+
+// validateSpec checks a spec's metadata for internal consistency. Register
+// runs it, so a bad table entry fails at startup rather than in production.
+func validateSpec(s Spec) error {
+	minArgs := s.Arity
+	if minArgs < 0 {
+		minArgs = -minArgs
+	}
+	switch {
+	case s.Name == "" || s.Name != strings.ToUpper(s.Name):
+		return fmt.Errorf("command %q: name must be non-empty and upper-case", s.Name)
+	case s.Arity == 0:
+		return fmt.Errorf("command %s: arity must be non-zero", s.Name)
+	case s.Flags&FlagWrite != 0 && s.Flags&FlagReadOnly != 0:
+		return fmt.Errorf("command %s: cannot be both write and readonly", s.Name)
+	}
+	if s.FirstKey == 0 {
+		if s.LastKey != 0 || s.Step != 0 {
+			return fmt.Errorf("command %s: no first key, so last key and step must be 0", s.Name)
+		}
+		return nil
+	}
+	switch {
+	case s.Flags&(FlagWrite|FlagReadOnly) == 0:
+		return fmt.Errorf("command %s: commands with keys must be flagged write or readonly", s.Name)
+	case s.FirstKey < 0 || s.FirstKey >= minArgs:
+		return fmt.Errorf("command %s: first key %d is outside the minimum %d tokens", s.Name, s.FirstKey, minArgs)
+	case s.Step < 1:
+		return fmt.Errorf("command %s: step must be at least 1", s.Name)
+	case s.LastKey < 0 && s.Arity > 0:
+		return fmt.Errorf("command %s: a negative last key needs variable arity", s.Name)
+	case s.LastKey < 0 && minArgs+s.LastKey < s.FirstKey:
+		return fmt.Errorf("command %s: last key %d can fall before the first key", s.Name, s.LastKey)
+	case s.LastKey >= 0 && (s.LastKey < s.FirstKey || s.LastKey >= minArgs):
+		return fmt.Errorf("command %s: last key %d is outside [%d, %d)", s.Name, s.LastKey, s.FirstKey, minArgs)
+	}
+	return nil
 }
 
 // Registry maps upper-case command names to specs. It is populated at startup
@@ -58,6 +121,9 @@ func (r *Registry) Register(spec Spec) error {
 		return fmt.Errorf("command %s: already registered", name)
 	}
 	spec.Name = name
+	if err := validateSpec(spec); err != nil {
+		return err
+	}
 	r.cmds[name] = &spec
 	return nil
 }
@@ -88,31 +154,58 @@ func (r *Registry) Names() []string {
 	return out
 }
 
-// NewDefaultRegistry returns a Registry with all Phase 1 commands.
+// NewDefaultRegistry returns a Registry with every implemented command.
 func NewDefaultRegistry() (*Registry, error) {
 	r := NewRegistry()
+	const (
+		ro  = FlagReadOnly
+		w   = FlagWrite
+		f   = FlagFast
+		adm = FlagAdmin
+	)
 	specs := []Spec{
-		{Name: "PING", Arity: -1, Flags: FlagFast, Handler: cmdPing},
-		{Name: "ECHO", Arity: 2, Flags: FlagFast, Handler: cmdEcho},
-		{Name: "QUIT", Arity: -1, Flags: FlagFast, Handler: cmdQuit},
-		{Name: "SELECT", Arity: 2, Flags: FlagFast, Handler: cmdSelect},
-		{Name: "CLIENT", Arity: -2, Flags: FlagAdmin, Handler: cmdClient},
-		{Name: "COMMAND", Arity: -1, Flags: FlagAdmin, Handler: cmdCommand},
-		{Name: "SET", Arity: -3, Flags: FlagWrite, Handler: cmdSet},
-		{Name: "GET", Arity: 2, Flags: FlagReadOnly | FlagFast, Handler: cmdGet},
-		{Name: "DEL", Arity: -2, Flags: FlagWrite, Handler: cmdDel},
-		{Name: "EXISTS", Arity: -2, Flags: FlagReadOnly | FlagFast, Handler: cmdExists},
-		{Name: "KEYS", Arity: 2, Flags: FlagReadOnly, Handler: cmdKeys},
-		{Name: "DBSIZE", Arity: 1, Flags: FlagReadOnly | FlagFast, Handler: cmdDBSize},
-		{Name: "FLUSHALL", Arity: -1, Flags: FlagWrite, Handler: cmdFlushAll},
-		{Name: "INCR", Arity: 2, Flags: FlagWrite | FlagFast, Handler: cmdIncr},
-		{Name: "DECR", Arity: 2, Flags: FlagWrite | FlagFast, Handler: cmdDecr},
-		{Name: "INCRBY", Arity: 3, Flags: FlagWrite | FlagFast, Handler: cmdIncrBy},
-		{Name: "DECRBY", Arity: 3, Flags: FlagWrite | FlagFast, Handler: cmdDecrBy},
-		{Name: "APPEND", Arity: 3, Flags: FlagWrite, Handler: cmdAppend},
-		{Name: "STRLEN", Arity: 2, Flags: FlagReadOnly | FlagFast, Handler: cmdStrlen},
-		{Name: "MSET", Arity: -3, Flags: FlagWrite, Handler: cmdMSet},
-		{Name: "MGET", Arity: -2, Flags: FlagReadOnly, Handler: cmdMGet},
+		// Connection and server commands take no keys.
+		{Name: "PING", Arity: -1, Flags: f, Handler: cmdPing},
+		{Name: "ECHO", Arity: 2, Flags: f, Handler: cmdEcho},
+		{Name: "QUIT", Arity: -1, Flags: f, Handler: cmdQuit},
+		{Name: "SELECT", Arity: 2, Flags: f, Handler: cmdSelect},
+		{Name: "CLIENT", Arity: -2, Flags: adm, Handler: cmdClient},
+		{Name: "COMMAND", Arity: -1, Flags: adm, Handler: cmdCommand},
+		{Name: "KEYS", Arity: 2, Flags: ro, Handler: cmdKeys}, // the argument is a pattern
+		{Name: "DBSIZE", Arity: 1, Flags: ro | f, Handler: cmdDBSize},
+		{Name: "FLUSHALL", Arity: -1, Flags: w, Handler: cmdFlushAll},
+
+		// Strings.
+		{Name: "SET", Arity: -3, Flags: w, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdSet},
+		{Name: "SETNX", Arity: 3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdSetNX},
+		{Name: "SETEX", Arity: 4, Flags: w, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdSetEX},
+		{Name: "PSETEX", Arity: 4, Flags: w, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPSetEX},
+		{Name: "GET", Arity: 2, Flags: ro | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdGet},
+		{Name: "GETEX", Arity: -2, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdGetEX},
+		{Name: "GETDEL", Arity: 2, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdGetDel},
+		{Name: "INCR", Arity: 2, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdIncr},
+		{Name: "DECR", Arity: 2, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdDecr},
+		{Name: "INCRBY", Arity: 3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdIncrBy},
+		{Name: "DECRBY", Arity: 3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdDecrBy},
+		{Name: "APPEND", Arity: 3, Flags: w, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdAppend},
+		{Name: "STRLEN", Arity: 2, Flags: ro | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdStrlen},
+		{Name: "MSET", Arity: -3, Flags: w, FirstKey: 1, LastKey: -1, Step: 2, Handler: cmdMSet},
+		{Name: "MGET", Arity: -2, Flags: ro, FirstKey: 1, LastKey: -1, Step: 1, Handler: cmdMGet},
+
+		// Keyspace.
+		{Name: "DEL", Arity: -2, Flags: w, FirstKey: 1, LastKey: -1, Step: 1, Handler: cmdDel},
+		{Name: "EXISTS", Arity: -2, Flags: ro | f, FirstKey: 1, LastKey: -1, Step: 1, Handler: cmdExists},
+
+		// Expiry.
+		{Name: "EXPIRE", Arity: -3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdExpire},
+		{Name: "PEXPIRE", Arity: -3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPExpire},
+		{Name: "EXPIREAT", Arity: -3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdExpireAt},
+		{Name: "PEXPIREAT", Arity: -3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPExpireAt},
+		{Name: "TTL", Arity: 2, Flags: ro | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdTTL},
+		{Name: "PTTL", Arity: 2, Flags: ro | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPTTL},
+		{Name: "PERSIST", Arity: 2, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPersist},
+		{Name: "EXPIRETIME", Arity: 2, Flags: ro | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdExpireTime},
+		{Name: "PEXPIRETIME", Arity: 2, Flags: ro | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPExpireTime},
 	}
 	for _, s := range specs {
 		if err := r.Register(s); err != nil {

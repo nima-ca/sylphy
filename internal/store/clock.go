@@ -40,3 +40,8 @@ func (c *FakeClock) Advance(d time.Duration) { c.ms.Add(d.Milliseconds()) }
 
 // Set moves the clock to an absolute Unix-millisecond reading.
 func (c *FakeClock) Set(ms int64) { c.ms.Store(ms) }
+
+// NowMs returns the store's current time in Unix milliseconds, from the same
+// Clock its expiry checks use. Command handlers use it to turn deadlines into
+// remaining TTLs.
+func (s *Store) NowMs() int64 { return s.clock.NowMs() }

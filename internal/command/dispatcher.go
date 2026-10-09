@@ -4,6 +4,8 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+
+	"github.com/nima-ca/sylphy/internal/store"
 )
 
 // Dispatcher resolves commands, validates arity, runs handlers and turns their
@@ -39,12 +41,15 @@ func (d *Dispatcher) Dispatch(ctx *Context, argv [][]byte) {
 	}
 	if err := spec.Handler(ctx, argv[1:]); err != nil {
 		var re *ReplyError
-		if errors.As(err, &re) {
+		switch {
+		case errors.As(err, &re):
 			ctx.W.WriteError(re.Msg)
-			return
+		case errors.Is(err, store.ErrWrongType):
+			ctx.W.WriteError(ErrWrongType.Msg)
+		default:
+			d.log.Error("command failed", "command", spec.Name, "err", err) // never log args: they may hold values
+			ctx.W.WriteError("ERR internal error")
 		}
-		d.log.Error("command failed", "command", spec.Name, "err", err) // never log args: they may hold values
-		ctx.W.WriteError("ERR internal error")
 	}
 }
 
