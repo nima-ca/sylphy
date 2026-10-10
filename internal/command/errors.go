@@ -25,6 +25,11 @@ var (
 	ErrNotFloat = &ReplyError{Msg: "ERR value is not a valid float"}
 	// ErrMustBePositive is returned when a count or size must be positive.
 	ErrMustBePositive = &ReplyError{Msg: "ERR value is out of range, must be positive"}
+	// ErrNoSuchKey is returned by commands that require an existing key (LSET,
+	// RENAME).
+	ErrNoSuchKey = &ReplyError{Msg: "ERR no such key"}
+	// ErrIndexOutOfRange is returned when an index points outside a list.
+	ErrIndexOutOfRange = &ReplyError{Msg: "ERR index out of range"}
 	// ErrWrongType is sent when a command meets a key of the wrong kind. The
 	// dispatcher maps store.ErrWrongType to it.
 	ErrWrongType = &ReplyError{Msg: "WRONGTYPE Operation against a key holding the wrong kind of value"}
