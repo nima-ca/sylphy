@@ -59,7 +59,8 @@ func expireAllowed(flags int, when, cur int64, hasTTL bool) bool {
 
 // expireGeneric implements EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT. As in
 // Redis, options are parsed before the integer, and a deadline that is not in
-// the future deletes the key (reply 1).
+// the future deletes the key (reply 1). The deadline it applied is recorded in
+// ctx.fx for the PEXPIREAT rewrite.
 func expireGeneric(ctx *Context, args [][]byte, name string, unit timeUnit, absolute bool) error {
 	flags, err := parseExpireFlags(args[2:])
 	if err != nil {
@@ -88,6 +89,7 @@ func expireGeneric(ctx *Context, args [][]byte, name string, unit timeUnit, abso
 	if err != nil {
 		return err
 	}
+	ctx.fx.Applied, ctx.fx.DeadlineMs = changed, when
 	if changed {
 		ctx.W.WriteInteger(1)
 	} else {
@@ -156,6 +158,7 @@ func cmdPersist(ctx *Context, args [][]byte) error {
 	if err != nil {
 		return err
 	}
+	ctx.fx.Applied = removed
 	if removed {
 		ctx.W.WriteInteger(1)
 	} else {

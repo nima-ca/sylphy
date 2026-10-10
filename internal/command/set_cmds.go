@@ -28,7 +28,8 @@ func setSpecs() []Spec {
 		{Name: "SISMEMBER", Arity: 3, Flags: ro | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdSIsMember},
 		{Name: "SMISMEMBER", Arity: -3, Flags: ro | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdSMIsMember},
 		{Name: "SCARD", Arity: 2, Flags: ro | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdSCard},
-		{Name: "SPOP", Arity: -2, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdSPop},
+		// SPOP picks members at random, so it is logged as an SREM of the members it removed.
+		{Name: "SPOP", Arity: -2, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdSPop, Rewrite: rewriteSPop},
 		{Name: "SRANDMEMBER", Arity: -2, Flags: ro, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdSRandMember},
 		{Name: "SMOVE", Arity: 4, Flags: w | f, FirstKey: 1, LastKey: 2, Step: 1, Handler: cmdSMove},
 		{Name: "SUNION", Arity: -2, Flags: ro, FirstKey: 1, LastKey: -1, Step: 1, Handler: cmdSUnion},
@@ -191,7 +192,8 @@ func cmdSCard(ctx *Context, args [][]byte) error {
 // cmdSPop implements SPOP key [count]. Without a count it replies a bulk (nil
 // for a missing key); with one it always replies an array, empty for a missing
 // key or a count of 0. The count is validated before the key is looked up, and
-// extra arguments are a syntax error, as in Redis.
+// extra arguments are a syntax error, as in Redis. The members actually popped
+// are recorded in ctx.fx for the SREM rewrite.
 func cmdSPop(ctx *Context, args [][]byte) error {
 	if len(args) > 2 {
 		return ErrSyntax
@@ -223,6 +225,7 @@ func cmdSPop(ctx *Context, args [][]byte) error {
 	if err != nil {
 		return err
 	}
+	ctx.fx.Members = popped
 	switch {
 	case hasCount:
 		writeStrings(ctx, popped)

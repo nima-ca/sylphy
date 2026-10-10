@@ -17,8 +17,6 @@ import (
 // need out of the closure and write the reply afterwards, so a slow client can
 // never stall a shard; a closure must not block, must not call back into the
 // Store, and must not retain the Values or Entries it is given.
-//
-// Part 7 adds Scan and RandomKey here, once the store implements them.
 type Store interface {
 	Get(key string) ([]byte, bool)
 	Set(key string, value []byte)
@@ -49,6 +47,12 @@ type Store interface {
 	ExpireAt(key string) int64
 	// NowMs returns the store clock in Unix ms.
 	NowMs() int64
+	// Scan returns a batch of keys and the next cursor (0 when the iteration
+	// is complete). keep, if non-nil, filters the batch. It returns
+	// store.ErrInvalidCursor for a cursor the store could not have issued.
+	Scan(cursor uint64, count int, keep func(key string, kind store.Kind) bool) (next uint64, keys []string, err error)
+	// RandomKey returns a random live key; ok is false if there is none.
+	RandomKey(intN func(n int) int) (key string, ok bool)
 }
 
 var _ Store = (*store.Store)(nil)
@@ -89,6 +93,21 @@ type Context struct {
 	// top-level functions of math/rand/v2. Because a Context belongs to one
 	// connection goroutine, a non-thread-safe generator is fine here.
 	Rand Rand
+
+	// Propagate asks Dispatch to fill Rewritten after each successful write
+	// command. It is off by default so that nothing is allocated until a
+	// consumer (the Phase 3 AOF) exists.
+	Propagate bool
+	// Rewritten holds the deterministic commands equivalent to the last
+	// Dispatch, ready to be logged: empty for reads, failed commands and
+	// no-ops. Dispatch resets it on every call. Entries produced by a
+	// Rewrite hook are copies; entries for commands logged verbatim alias the
+	// request, so a consumer must use or copy them before the next read from
+	// the connection.
+	Rewritten [][][]byte
+
+	// fx is the scratch record for the write command being executed.
+	fx Effects
 }
 
 // intN returns a random integer in [0, n) from ctx.Rand, or from math/rand/v2

@@ -16,12 +16,22 @@ const DefaultShards = 32
 // positive power of two.
 var ErrInvalidShardCount = errors.New("store: shard count must be a positive power of two")
 
-// shard guards one slice of the keyspace. Invariant: every key in exp is also
-// in m (see expire.go).
+// orderShrinkMinCap is the capacity below which a shard's order slice is never
+// reallocated to give memory back.
+const orderShrinkMinCap = 64
+
+// shard guards one slice of the keyspace. Invariants: every key in exp is also
+// in m (see expire.go); order and pos index exactly the keys of m, with
+// pos[order[i]] == i (see scan.go for why SCAN needs this).
 type shard struct {
 	mu  sync.RWMutex
 	m   map[string]Value
 	exp map[string]int64 // key -> absolute deadline, Unix ms
+
+	// order lists the keys of m in slot order; a new key takes the next slot
+	// and a deleted key's slot is refilled by moving the last key into it.
+	order []string
+	pos   map[string]int // key -> index in order
 }
 
 // Options configures NewWithOptions. Zero values select defaults, except
@@ -97,6 +107,7 @@ func NewWithOptions(o Options) (*Store, error) {
 	for i := range s.shards {
 		s.shards[i].m = make(map[string]Value)
 		s.shards[i].exp = make(map[string]int64)
+		s.shards[i].pos = make(map[string]int)
 	}
 	return s, nil
 }
@@ -121,10 +132,44 @@ func (sh *shard) expired(key string, now int64) bool {
 	return ok && now > at
 }
 
+// track records key in the slot index if it is new. The write lock must be
+// held, and the caller must have stored (or be about to store) key in m.
+func (sh *shard) track(key string) {
+	if _, ok := sh.pos[key]; ok {
+		return
+	}
+	sh.pos[key] = len(sh.order)
+	sh.order = append(sh.order, key)
+}
+
+// untrack drops key from the slot index by moving the last key into its slot
+// (swap-remove). Keys therefore only ever move to a lower slot, which is the
+// property SCAN's descending walk relies on. The write lock must be held.
+func (sh *shard) untrack(key string) {
+	i, ok := sh.pos[key]
+	if !ok {
+		return
+	}
+	last := len(sh.order) - 1
+	if i != last {
+		moved := sh.order[last]
+		sh.order[i] = moved
+		sh.pos[moved] = i
+	}
+	sh.order[last] = "" // do not pin the key's bytes through the spare capacity
+	sh.order = sh.order[:last]
+	delete(sh.pos, key)
+	// Go slices never shrink on their own; give memory back after mass deletion.
+	if c := cap(sh.order); c > orderShrinkMinCap && len(sh.order) <= c/4 {
+		sh.order = append(make([]string, 0, 2*len(sh.order)), sh.order...)
+	}
+}
+
 // remove deletes key together with its deadline.
 func (sh *shard) remove(key string) {
 	delete(sh.m, key)
 	delete(sh.exp, key)
+	sh.untrack(key)
 }
 
 // peek returns the live value of key without mutating anything (read lock
@@ -154,6 +199,7 @@ func (sh *shard) put(key string, v Value) {
 		return
 	}
 	sh.m[key] = v
+	sh.track(key)
 }
 
 // liveLocked returns the live value of key, removing it first if it has
@@ -291,6 +337,30 @@ func (e *Entry) Persist() bool {
 	return ok
 }
 
+// MoveTo moves e's value and deadline to dst, replacing whatever dst held
+// (value of any type and its TTL), and removes e's key. It is the primitive
+// behind RENAME. Unlike Put plus SetExpireAt it keeps a deadline that equals
+// the current millisecond instead of deleting the key. It does nothing if e's
+// key does not exist or e and dst name the same key. Both entries must come
+// from the same Atomic call, so both shards are locked.
+func (e *Entry) MoveTo(dst *Entry) {
+	if e == dst || e.key == dst.key {
+		return
+	}
+	v, ok := e.sh.m[e.key]
+	if !ok {
+		return
+	}
+	at, hasAt := e.sh.exp[e.key]
+	e.sh.remove(e.key)
+	dst.sh.put(dst.key, v) // v is a live, non-empty value, so it is stored
+	if hasAt {
+		dst.sh.exp[dst.key] = at
+	} else {
+		delete(dst.sh.exp, dst.key)
+	}
+}
+
 // MutateEntry runs fn under the shard's write lock with a handle to key. It is
 // the TTL-aware sibling of Mutate, used by SET, EXPIRE, GETEX, GETDEL and
 // similar commands that read and change value and deadline together.
@@ -311,8 +381,8 @@ func (s *Store) MutateEntry(key string, fn func(e *Entry) error) error {
 // acquire them in ascending shard-index order, each shard once. With every
 // multi-lock path following one global order there can be no cycle of waiting
 // goroutines, so no deadlock. Single-key operations hold exactly one shard
-// lock and cannot take part in a cycle. The sweeper and Flush also hold one
-// lock at a time.
+// lock and cannot take part in a cycle. The sweeper, Scan, RandomKey and Flush
+// also hold one lock at a time.
 func (s *Store) lockOrder(keys []string) []int {
 	order := make([]int, len(keys))
 	for i, k := range keys {
@@ -413,6 +483,7 @@ func (s *Store) Set(key string, value []byte) {
 	sh := s.shardFor(key)
 	sh.mu.Lock()
 	sh.m[key] = v
+	sh.track(key)
 	delete(sh.exp, key)
 	sh.mu.Unlock()
 }
@@ -477,6 +548,8 @@ func (s *Store) Flush() {
 		sh.mu.Lock()
 		sh.m = make(map[string]Value)
 		sh.exp = make(map[string]int64)
+		sh.pos = make(map[string]int)
+		sh.order = nil
 		sh.mu.Unlock()
 	}
 }
@@ -539,5 +612,6 @@ func (s *Store) Update(key string, fn func(old []byte, exists bool) (newValue []
 		nv = []byte{}
 	}
 	sh.m[key] = &String{b: nv}
+	sh.track(key)
 	return nil
 }

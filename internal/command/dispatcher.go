@@ -26,7 +26,12 @@ func NewDispatcher(reg *Registry, log *slog.Logger) *Dispatcher {
 // Dispatch executes argv (command name first) and writes the reply to ctx.W.
 // It never returns an error: every failure becomes a RESP error reply. Reply
 // write errors are surfaced later by Writer.Flush.
+//
+// If ctx.Propagate is set, a write command that succeeded leaves its
+// deterministic form in ctx.Rewritten (see RewriteFunc); in every other case
+// ctx.Rewritten is empty after the call.
 func (d *Dispatcher) Dispatch(ctx *Context, argv [][]byte) {
+	ctx.Rewritten = nil
 	if len(argv) == 0 {
 		return
 	}
@@ -39,6 +44,10 @@ func (d *Dispatcher) Dispatch(ctx *Context, argv [][]byte) {
 		ctx.W.WriteError(WrongArgs(spec.Name).Msg)
 		return
 	}
+	isWrite := spec.Flags&FlagWrite != 0
+	if isWrite {
+		ctx.fx = Effects{}
+	}
 	if err := spec.Handler(ctx, argv[1:]); err != nil {
 		var re *ReplyError
 		switch {
@@ -50,6 +59,10 @@ func (d *Dispatcher) Dispatch(ctx *Context, argv [][]byte) {
 			d.log.Error("command failed", "command", spec.Name, "err", err) // never log args: they may hold values
 			ctx.W.WriteError("ERR internal error")
 		}
+		return
+	}
+	if ctx.Propagate && isWrite {
+		ctx.Rewritten = spec.rewritten(argv, &ctx.fx)
 	}
 }
 

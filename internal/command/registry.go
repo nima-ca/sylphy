@@ -39,6 +39,11 @@ type Spec struct {
 	FirstKey, LastKey, Step int
 	// Handler runs the command.
 	Handler Handler
+	// Rewrite, for write commands whose argv would not replay
+	// deterministically, produces the commands to log instead (see
+	// RewriteFunc). Nil means the request is logged verbatim. Only write
+	// commands may set it.
+	Rewrite RewriteFunc
 }
 
 // Keys returns the key arguments of argv (command name first) according to the
@@ -73,6 +78,8 @@ func validateSpec(s Spec) error {
 		return fmt.Errorf("command %s: arity must be non-zero", s.Name)
 	case s.Flags&FlagWrite != 0 && s.Flags&FlagReadOnly != 0:
 		return fmt.Errorf("command %s: cannot be both write and readonly", s.Name)
+	case s.Rewrite != nil && s.Flags&FlagWrite == 0:
+		return fmt.Errorf("command %s: only write commands may have a Rewrite hook", s.Name)
 	}
 	if s.FirstKey == 0 {
 		if s.LastKey != 0 || s.Step != 0 {
@@ -175,14 +182,15 @@ func NewDefaultRegistry() (*Registry, error) {
 		{Name: "DBSIZE", Arity: 1, Flags: ro | f, Handler: cmdDBSize},
 		{Name: "FLUSHALL", Arity: -1, Flags: w, Handler: cmdFlushAll},
 
-		// Strings.
-		{Name: "SET", Arity: -3, Flags: w, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdSet},
-		{Name: "SETNX", Arity: 3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdSetNX},
-		{Name: "SETEX", Arity: 4, Flags: w, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdSetEX},
-		{Name: "PSETEX", Arity: 4, Flags: w, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPSetEX},
+		// Strings. Commands with TTL options or conditional outcomes carry a
+		// Rewrite hook; the rest replay verbatim.
+		{Name: "SET", Arity: -3, Flags: w, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdSet, Rewrite: rewriteSet},
+		{Name: "SETNX", Arity: 3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdSetNX, Rewrite: rewriteSetNX},
+		{Name: "SETEX", Arity: 4, Flags: w, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdSetEX, Rewrite: rewriteSetWithTTL},
+		{Name: "PSETEX", Arity: 4, Flags: w, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPSetEX, Rewrite: rewriteSetWithTTL},
 		{Name: "GET", Arity: 2, Flags: ro | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdGet},
-		{Name: "GETEX", Arity: -2, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdGetEX},
-		{Name: "GETDEL", Arity: 2, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdGetDel},
+		{Name: "GETEX", Arity: -2, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdGetEX, Rewrite: rewriteGetEX},
+		{Name: "GETDEL", Arity: 2, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdGetDel, Rewrite: rewriteGetDel},
 		{Name: "INCR", Arity: 2, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdIncr},
 		{Name: "DECR", Arity: 2, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdDecr},
 		{Name: "INCRBY", Arity: 3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdIncrBy},
@@ -196,14 +204,14 @@ func NewDefaultRegistry() (*Registry, error) {
 		{Name: "DEL", Arity: -2, Flags: w, FirstKey: 1, LastKey: -1, Step: 1, Handler: cmdDel},
 		{Name: "EXISTS", Arity: -2, Flags: ro | f, FirstKey: 1, LastKey: -1, Step: 1, Handler: cmdExists},
 
-		// Expiry.
-		{Name: "EXPIRE", Arity: -3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdExpire},
-		{Name: "PEXPIRE", Arity: -3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPExpire},
-		{Name: "EXPIREAT", Arity: -3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdExpireAt},
-		{Name: "PEXPIREAT", Arity: -3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPExpireAt},
+		// Expiry: relative and conditional forms all rewrite to PEXPIREAT.
+		{Name: "EXPIRE", Arity: -3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdExpire, Rewrite: rewriteExpire},
+		{Name: "PEXPIRE", Arity: -3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPExpire, Rewrite: rewriteExpire},
+		{Name: "EXPIREAT", Arity: -3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdExpireAt, Rewrite: rewriteExpire},
+		{Name: "PEXPIREAT", Arity: -3, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPExpireAt, Rewrite: rewriteExpire},
 		{Name: "TTL", Arity: 2, Flags: ro | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdTTL},
 		{Name: "PTTL", Arity: 2, Flags: ro | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPTTL},
-		{Name: "PERSIST", Arity: 2, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPersist},
+		{Name: "PERSIST", Arity: 2, Flags: w | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPersist, Rewrite: rewritePersist},
 		{Name: "EXPIRETIME", Arity: 2, Flags: ro | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdExpireTime},
 		{Name: "PEXPIRETIME", Arity: 2, Flags: ro | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPExpireTime},
 	}
@@ -212,6 +220,7 @@ func NewDefaultRegistry() (*Registry, error) {
 	specs = append(specs, hashSpecs()...)
 	specs = append(specs, setSpecs()...)
 	specs = append(specs, zsetSpecs()...)
+	specs = append(specs, keySpecs()...)
 	for _, s := range specs {
 		if err := r.Register(s); err != nil {
 			return nil, err

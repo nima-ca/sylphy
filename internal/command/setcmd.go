@@ -75,11 +75,13 @@ func parseSetOptions(args [][]byte, now int64) (setOptions, error) {
 
 // cmdSet implements SET key value [NX|XX] [GET] [EX|PX|EXAT|PXAT n|KEEPTTL].
 // Plain SET takes the unconditional fast path; anything with options runs as
-// one critical section so GET/NX/XX/TTL changes are atomic.
+// one critical section so GET/NX/XX/TTL changes are atomic. The outcome and
+// the applied deadline are recorded in ctx.fx for the rewrite hook.
 func cmdSet(ctx *Context, args [][]byte) error {
 	key := string(args[0])
 	if len(args) == 2 {
 		ctx.Store.Set(key, args[1]) // overwrites any type and clears the TTL
+		ctx.fx.Applied = true
 		ctx.W.WriteSimpleString("OK")
 		return nil
 	}
@@ -115,6 +117,7 @@ func cmdSet(ctx *Context, args [][]byte) error {
 	if err != nil {
 		return err
 	}
+	ctx.fx = Effects{Applied: applied, KeepTTL: o.keepTTL, HasDeadline: o.hasExpire, DeadlineMs: o.expireAt}
 	switch {
 	case o.get && hadOld:
 		ctx.W.WriteBulk(old)
@@ -142,6 +145,7 @@ func cmdSetNX(ctx *Context, args [][]byte) error {
 	if err != nil {
 		return err
 	}
+	ctx.fx.Applied = set
 	if set {
 		ctx.W.WriteInteger(1)
 	} else {
@@ -166,6 +170,7 @@ func setWithTTL(ctx *Context, args [][]byte, name string, unit timeUnit) error {
 	if err != nil {
 		return err
 	}
+	ctx.fx = Effects{Applied: true, HasDeadline: true, DeadlineMs: at}
 	ctx.W.WriteSimpleString("OK")
 	return nil
 }
@@ -232,6 +237,7 @@ func cmdGetEX(ctx *Context, args [][]byte) error {
 		ctx.W.WriteNullBulk()
 		return nil
 	}
+	ctx.fx = Effects{Applied: true, Persist: persist, HasDeadline: hasExpire, DeadlineMs: at}
 	ctx.W.WriteBulk(out)
 	return nil
 }
@@ -255,6 +261,7 @@ func cmdGetDel(ctx *Context, args [][]byte) error {
 		ctx.W.WriteNullBulk()
 		return nil
 	}
+	ctx.fx.Applied = true
 	ctx.W.WriteBulk(out)
 	return nil
 }
