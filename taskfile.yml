@@ -59,9 +59,14 @@ tasks:
             - go test ./internal/protocol -run '^$' -fuzz FuzzReader -fuzztime 20s
 
     bench:
-        desc: Run benchmarks
+        desc: Run all benchmarks, including the 1M-key expiry ones (takes a few minutes)
         cmds:
-            - go test -run '^$' -bench . -benchmem ./internal/protocol ./internal/store
+            - go test -run '^$' -bench . -benchmem ./internal/protocol ./internal/store ./internal/list ./internal/zset
+
+    bench-short:
+        desc: Run the quick benchmarks only (skips the 1M-key expiry ones)
+        cmds:
+            - go test -short -run '^$' -bench . -benchmem ./internal/protocol ./internal/store ./internal/list ./internal/zset
 
     docker:
         desc: Build the Docker image

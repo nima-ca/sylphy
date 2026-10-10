@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net"
@@ -10,8 +11,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"context"
 
 	"github.com/redis/go-redis/v9"
 
@@ -24,6 +23,7 @@ import (
 type testServer struct {
 	addr   string
 	srv    *server.Server
+	st     *store.Store
 	cancel context.CancelFunc
 	done   chan error
 	once   sync.Once
@@ -43,10 +43,18 @@ func (ts *testServer) stop() error {
 	return ts.err
 }
 
-// startServer boots a server on 127.0.0.1:0. Its cleanup stops the server and
-// verifies no goroutines leaked. Cleanups run LIFO, so clients created after
-// this call are closed first.
+// startServer boots a server on 127.0.0.1:0 with the system clock. Its cleanup
+// stops the server and the store's sweeper and verifies no goroutines leaked.
+// Cleanups run LIFO, so clients created after this call are closed first.
 func startServer(t *testing.T, mutate func(*config.Config)) *testServer {
+	t.Helper()
+	return startServerWithClock(t, nil, mutate)
+}
+
+// startServerWithClock is startServer with an injected store clock (nil means
+// the system clock). With a store.FakeClock, tests move time deterministically
+// while the sweeper, which is driven by a real ticker, still runs.
+func startServerWithClock(t *testing.T, clk store.Clock, mutate func(*config.Config)) *testServer {
 	t.Helper()
 	before := runtime.NumGoroutine()
 
@@ -56,10 +64,11 @@ func startServer(t *testing.T, mutate func(*config.Config)) *testServer {
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	st, err := store.New(cfg.Shards)
+	st, err := store.NewWithOptions(store.Options{Shards: cfg.Shards, Clock: clk})
 	if err != nil {
 		t.Fatal(err)
 	}
+	st.Start() // as cmd/sylphy-server does; Close below stops it
 	reg, err := command.NewDefaultRegistry()
 	if err != nil {
 		t.Fatal(err)
@@ -70,13 +79,14 @@ func startServer(t *testing.T, mutate func(*config.Config)) *testServer {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	ts := &testServer{addr: ln.Addr().String(), srv: srv, cancel: cancel, done: make(chan error, 1)}
+	ts := &testServer{addr: ln.Addr().String(), srv: srv, st: st, cancel: cancel, done: make(chan error, 1)}
 	go func() { ts.done <- srv.Serve(ctx, ln) }()
 
 	t.Cleanup(func() {
 		if err := ts.stop(); err != nil && !errors.Is(err, server.ErrServerClosed) {
 			t.Errorf("server stop: %v", err)
 		}
+		st.Close()
 		waitGoroutines(t, before)
 	})
 	return ts
