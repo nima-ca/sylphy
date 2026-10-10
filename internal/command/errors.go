@@ -30,6 +30,16 @@ var (
 	ErrNoSuchKey = &ReplyError{Msg: "ERR no such key"}
 	// ErrIndexOutOfRange is returned when an index points outside a list.
 	ErrIndexOutOfRange = &ReplyError{Msg: "ERR index out of range"}
+	// ErrHashNotInt is returned by HINCRBY when the field is not an integer.
+	ErrHashNotInt = &ReplyError{Msg: "ERR hash value is not an integer"}
+	// ErrHashNotFloat is returned by HINCRBYFLOAT when the field is not a float.
+	ErrHashNotFloat = &ReplyError{Msg: "ERR hash value is not a float"}
+	// ErrNaNOrInf is returned when a float increment would produce NaN or
+	// infinity.
+	ErrNaNOrInf = &ReplyError{Msg: "ERR increment would produce NaN or Infinity"}
+	// ErrSampleTooLarge is returned for a SRANDMEMBER count below
+	// -maxRepeatSample (a deliberate limit; see docs/COMMANDS.md).
+	ErrSampleTooLarge = &ReplyError{Msg: "ERR count is too large: a negative SRANDMEMBER count is limited to 1048576"}
 	// ErrWrongType is sent when a command meets a key of the wrong kind. The
 	// dispatcher maps store.ErrWrongType to it.
 	ErrWrongType = &ReplyError{Msg: "WRONGTYPE Operation against a key holding the wrong kind of value"}

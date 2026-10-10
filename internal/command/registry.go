@@ -163,7 +163,6 @@ func NewDefaultRegistry() (*Registry, error) {
 		f   = FlagFast
 		adm = FlagAdmin
 	)
-
 	specs := []Spec{
 		// Connection and server commands take no keys.
 		{Name: "PING", Arity: -1, Flags: f, Handler: cmdPing},
@@ -208,9 +207,10 @@ func NewDefaultRegistry() (*Registry, error) {
 		{Name: "EXPIRETIME", Arity: 2, Flags: ro | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdExpireTime},
 		{Name: "PEXPIRETIME", Arity: 2, Flags: ro | f, FirstKey: 1, LastKey: 1, Step: 1, Handler: cmdPExpireTime},
 	}
-
 	// Each data type contributes its own table; later parts append theirs here.
 	specs = append(specs, listSpecs()...)
+	specs = append(specs, hashSpecs()...)
+	specs = append(specs, setSpecs()...)
 	for _, s := range specs {
 		if err := r.Register(s); err != nil {
 			return nil, err

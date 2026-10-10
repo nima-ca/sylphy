@@ -1,6 +1,8 @@
 package command
 
 import (
+	"math/rand/v2"
+
 	"github.com/nima-ca/sylphy/internal/config"
 	"github.com/nima-ca/sylphy/internal/protocol"
 	"github.com/nima-ca/sylphy/internal/store"
@@ -51,6 +53,14 @@ type Store interface {
 
 var _ Store = (*store.Store)(nil)
 
+// Rand supplies random integers to handlers (SPOP, SRANDMEMBER, ...).
+// *rand.Rand from math/rand/v2 implements it, which is how tests inject a
+// seeded generator.
+type Rand interface {
+	// IntN returns a value in [0, n); n must be positive.
+	IntN(n int) int
+}
+
 // ConnState is per-connection state visible to handlers. Phase 4 adds fields
 // here (transaction queue, subscriptions); existing handlers keep compiling
 // because they only ever see *Context.
@@ -75,4 +85,17 @@ type Context struct {
 	Config *config.Config
 	// Conn is the per-connection state.
 	Conn *ConnState
+	// Rand is the source of randomness; nil means the goroutine-safe
+	// top-level functions of math/rand/v2. Because a Context belongs to one
+	// connection goroutine, a non-thread-safe generator is fine here.
+	Rand Rand
+}
+
+// intN returns a random integer in [0, n) from ctx.Rand, or from math/rand/v2
+// when none is set. n must be positive.
+func (c *Context) intN(n int) int {
+	if c.Rand != nil {
+		return c.Rand.IntN(n)
+	}
+	return rand.IntN(n)
 }
