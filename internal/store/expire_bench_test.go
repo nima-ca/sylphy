@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"runtime"
 	"strconv"
 	"sync"
@@ -101,7 +102,7 @@ func BenchmarkOverwrite1M(b *testing.B) {
 }
 
 // BenchmarkLen1M shows what DBSIZE costs: Len walks the expiry index, so it is
-// proportional to the number of TTL keys, not constant.
+// proportional to the number of keys with a TTL, not constant.
 func BenchmarkLen1M(b *testing.B) {
 	for _, tc := range []struct {
 		name string
@@ -118,24 +119,64 @@ func BenchmarkLen1M(b *testing.B) {
 	}
 }
 
-// BenchmarkSweepCycle1M is the cost of one sweeper cycle over a store holding
-// 1M TTL keys of which none are due: it depends on shards and sample size, not
-// on the keyspace size. It runs last on the shared store because Close stops
-// the sweeper for good.
-func BenchmarkSweepCycle1M(b *testing.B) {
-	s, _ := bigTTL.get(b, true)
-	tick := make(chan time.Time)
-	if !s.startWith(tick, func() {}) {
-		b.Skip("sweeper already closed by an earlier run")
-	}
-	defer s.Close()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		before := s.sweepCycles.Load()
-		tick <- time.Time{}
-		for s.sweepCycles.Load() == before {
-			runtime.Gosched()
+// sweepFixture is a store of n far-future TTL keys with a sweeper driven by a
+// tick channel. The sweeper is started once and deliberately never closed: a
+// store's lifecycle is one-shot, and the testing package calls a benchmark
+// function several times with growing b.N, so closing it after the first call
+// would leave the later calls without a sweeper. The process exits right after
+// the benchmarks, which reclaims the goroutine.
+type sweepFixture struct {
+	once sync.Once
+	s    *Store
+	tick chan time.Time
+}
+
+var sweepFixtures = map[int]*sweepFixture{10_000: {}, benchKeys: {}}
+
+func (f *sweepFixture) get(b *testing.B, n int) (*Store, chan time.Time) {
+	b.Helper()
+	f.once.Do(func() {
+		s, err := New(DefaultShards)
+		if err != nil {
+			b.Fatal(err)
 		}
+		val := []byte("v")
+		deadline := s.clock.NowMs() + int64(time.Hour/time.Millisecond)
+		for i := 0; i < n; i++ {
+			_ = s.MutateEntry("key:"+strconv.Itoa(i), func(e *Entry) error {
+				e.Put(NewString(val))
+				e.SetExpireAt(deadline)
+				return nil
+			})
+		}
+		f.tick = make(chan time.Time)
+		if !s.startWith(f.tick, func() {}) {
+			b.Fatal("sweeper did not start")
+		}
+		f.s = s
+	})
+	return f.s, f.tick
+}
+
+// BenchmarkSweepCycle is the cost of one sweeper cycle over a store whose TTL
+// keys are none of them due. It depends on the shard count and the sample size,
+// so 10k and 1M keys should cost about the same.
+func BenchmarkSweepCycle(b *testing.B) {
+	for _, n := range []int{10_000, benchKeys} {
+		b.Run(fmt.Sprintf("keys=%d", n), func(b *testing.B) {
+			if n >= benchKeys && testing.Short() {
+				b.Skip("1M-key benchmark skipped in -short mode")
+			}
+			s, tick := sweepFixtures[n].get(b, n)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				before := s.sweepCycles.Load()
+				tick <- time.Time{}
+				for s.sweepCycles.Load() == before {
+					runtime.Gosched()
+				}
+			}
+		})
 	}
 }
 
