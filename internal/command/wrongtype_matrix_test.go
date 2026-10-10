@@ -4,8 +4,7 @@ import "testing"
 
 // TestWrongTypeMatrix runs every command family against keys of every other
 // type and expects WRONGTYPE each time, without any change to those keys. "KEY"
-// stands for the key under test; "other" is a set that contains "m". Later
-// parts add the sorted-set family here.
+// stands for the key under test; "other" is a set that contains "m".
 func TestWrongTypeMatrix(t *testing.T) {
 	families := map[string][][]string{
 		"string": {
@@ -35,8 +34,19 @@ func TestWrongTypeMatrix(t *testing.T) {
 			{"SUNIONSTORE", "dst", "KEY", "other"}, {"SINTERSTORE", "dst", "other", "KEY"},
 			{"SDIFFSTORE", "dst", "KEY", "other"},
 		},
+		"zset": {
+			{"ZADD", "KEY", "1", "m"}, {"ZADD", "KEY", "NX", "1", "m"}, {"ZADD", "KEY", "XX", "CH", "1", "m"},
+			{"ZADD", "KEY", "INCR", "1", "m"}, {"ZREM", "KEY", "m"}, {"ZSCORE", "KEY", "m"},
+			{"ZMSCORE", "KEY", "m"}, {"ZINCRBY", "KEY", "1", "m"}, {"ZCARD", "KEY"},
+			{"ZCOUNT", "KEY", "-inf", "+inf"}, {"ZRANK", "KEY", "m"}, {"ZRANK", "KEY", "m", "WITHSCORE"},
+			{"ZREVRANK", "KEY", "m"}, {"ZRANGE", "KEY", "0", "-1"}, {"ZRANGE", "KEY", "0", "-1", "REV", "WITHSCORES"},
+			{"ZRANGE", "KEY", "0", "10", "BYSCORE", "LIMIT", "0", "1"}, {"ZREVRANGE", "KEY", "0", "-1"},
+			{"ZRANGEBYSCORE", "KEY", "-inf", "+inf"}, {"ZREVRANGEBYSCORE", "KEY", "+inf", "-inf"},
+			{"ZREMRANGEBYRANK", "KEY", "0", "-1"}, {"ZREMRANGEBYSCORE", "KEY", "-inf", "+inf"},
+			{"ZPOPMIN", "KEY"}, {"ZPOPMAX", "KEY", "2"},
+		},
 	}
-	keys := map[string]string{"string": "k_string", "list": "k_list", "hash": "k_hash", "set": "k_set"}
+	keys := map[string]string{"string": "k_string", "list": "k_list", "hash": "k_hash", "set": "k_set", "zset": "k_zset"}
 
 	h := newHarness(t)
 	h.run(t, []step{
@@ -44,6 +54,7 @@ func TestWrongTypeMatrix(t *testing.T) {
 		do(rInt(1), "RPUSH", "k_list", "a"),
 		do(rInt(1), "HSET", "k_hash", "f", "v"),
 		do(rInt(1), "SADD", "k_set", "m"),
+		do(rInt(1), "ZADD", "k_zset", "1", "m"),
 		do(rInt(1), "SADD", "other", "m"),
 	})
 	for family, cmds := range families {
@@ -72,6 +83,8 @@ func TestWrongTypeMatrix(t *testing.T) {
 		do(rInt(1), "LLEN", "k_list"),
 		do(rInt(1), "HLEN", "k_hash"),
 		do(rInt(1), "SCARD", "k_set"),
+		do(rInt(1), "ZCARD", "k_zset"),
+		do(rBulk("1"), "ZSCORE", "k_zset", "m"),
 		do(rInt(1), "SCARD", "other"),
 		do(rInt(0), "EXISTS", "dst"),
 	})
