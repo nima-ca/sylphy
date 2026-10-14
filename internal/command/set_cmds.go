@@ -193,7 +193,7 @@ func cmdSCard(ctx *Context, args [][]byte) error {
 // for a missing key); with one it always replies an array, empty for a missing
 // key or a count of 0. The count is validated before the key is looked up, and
 // extra arguments are a syntax error, as in Redis. The members actually popped
-// are recorded in ctx.fx for the SREM rewrite.
+// are recorded in ctx.fx, inside the critical section, for the SREM rewrite.
 func cmdSPop(ctx *Context, args [][]byte) error {
 	if len(args) > 2 {
 		return ErrSyntax
@@ -220,12 +220,12 @@ func cmdSPop(ctx *Context, args [][]byte) error {
 			m, _ := ss.PopRandom(ctx.intN)
 			popped = []string{m}
 		}
+		ctx.fx.Members = popped
 		return ss, nil // an emptied set is deleted by the store, TTL included
 	})
 	if err != nil {
 		return err
 	}
-	ctx.fx.Members = popped
 	switch {
 	case hasCount:
 		writeStrings(ctx, popped)

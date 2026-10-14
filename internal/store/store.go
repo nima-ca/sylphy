@@ -32,6 +32,16 @@ type shard struct {
 	// and a deleted key's slot is refilled by moving the last key into it.
 	order []string
 	pos   map[string]int // key -> index in order
+
+	// st and idx locate the shard for the copy-on-write gate and the expiry
+	// hook.
+	st  *Store
+	idx int
+	// snap is non-nil while a snapshot still needs this shard as it was when
+	// the snapshot began. Every write-lock acquisition goes through lockW,
+	// which serializes the shard before letting a writer change it (see
+	// snapshot.go).
+	snap atomic.Pointer[Snapshot]
 }
 
 // Options configures NewWithOptions. Zero values select defaults, except
@@ -56,16 +66,27 @@ type Options struct {
 // shard lock, so it must be fast, must not block, must not call back into the
 // Store (the locks are not reentrant), and must not retain the Values it is
 // given.
+//
+// Persistence hooks (see hooks.go and snapshot.go): SetExpireHook reports every
+// expiry under the shard lock; BeginSnapshot takes a point-in-time copy with
+// shard-granular copy-on-write; Load and BeginReplay support recovery.
 type Store struct {
 	shards []shard
 	mask   uint64
 	seed   maphash.Seed
 	clock  Clock
+	replay *replayClock // the wrapper installed as clock; see BeginReplay
 	sweep  SweepConfig
 
 	expiredLazy   atomic.Int64
 	expiredActive atomic.Int64
 	sweepCycles   atomic.Int64
+
+	onExpire atomic.Pointer[func(key string)]
+
+	snapMu     sync.Mutex
+	snapActive *Snapshot
+	gateHits   atomic.Int64 // shards serialized by a writer instead of the snapshot goroutine
 
 	wall func() time.Time // real-time source for the sweep budget; tests replace it
 	// afterLock, if set, runs after each shard lock Atomic/AtomicView takes.
@@ -95,11 +116,13 @@ func NewWithOptions(o Options) (*Store, error) {
 	if err := o.Sweep.Validate(); err != nil {
 		return nil, err
 	}
+	rc := &replayClock{inner: o.Clock}
 	s := &Store{
 		shards: make([]shard, o.Shards),
 		mask:   uint64(o.Shards - 1),
 		seed:   maphash.MakeSeed(), // random per store: defeats hash-flooding
-		clock:  o.Clock,
+		clock:  rc,
+		replay: rc,
 		sweep:  o.Sweep,
 		wall:   time.Now,
 	}
@@ -108,6 +131,8 @@ func NewWithOptions(o Options) (*Store, error) {
 		s.shards[i].m = make(map[string]Value)
 		s.shards[i].exp = make(map[string]int64)
 		s.shards[i].pos = make(map[string]int)
+		s.shards[i].st = s
+		s.shards[i].idx = i
 	}
 	return s, nil
 }
@@ -203,7 +228,8 @@ func (sh *shard) put(key string, v Value) {
 }
 
 // liveLocked returns the live value of key, removing it first if it has
-// expired (lazy expiry). The write lock must be held.
+// expired (lazy expiry; the expiry hook runs, still under the lock). The write
+// lock must be held.
 func (s *Store) liveLocked(sh *shard, key string, now int64) Value {
 	v, ok := sh.m[key]
 	if !ok {
@@ -212,6 +238,7 @@ func (s *Store) liveLocked(sh *shard, key string, now int64) Value {
 	if sh.expired(key, now) {
 		sh.remove(key)
 		s.expiredLazy.Add(1)
+		s.noteExpired(key)
 		return nil
 	}
 	return v
@@ -219,7 +246,7 @@ func (s *Store) liveLocked(sh *shard, key string, now int64) Value {
 
 // reap removes key if it is expired.
 func (s *Store) reap(sh *shard, key string) {
-	sh.mu.Lock()
+	sh.lockW()
 	s.liveLocked(sh, key, s.clock.NowMs())
 	sh.mu.Unlock()
 }
@@ -266,7 +293,7 @@ func (s *Store) View(key string, fn func(v Value) error) error {
 // it modifies cur in place.
 func (s *Store) Mutate(key string, fn func(cur Value) (Value, error)) error {
 	sh := s.shardFor(key)
-	sh.mu.Lock()
+	sh.lockW()
 	defer sh.mu.Unlock()
 	nv, err := fn(s.liveLocked(sh, key, s.clock.NowMs()))
 	if err != nil {
@@ -366,7 +393,7 @@ func (e *Entry) MoveTo(dst *Entry) {
 // similar commands that read and change value and deadline together.
 func (s *Store) MutateEntry(key string, fn func(e *Entry) error) error {
 	sh := s.shardFor(key)
-	sh.mu.Lock()
+	sh.lockW()
 	defer sh.mu.Unlock()
 	now := s.clock.NowMs()
 	s.liveLocked(sh, key, now)
@@ -381,8 +408,9 @@ func (s *Store) MutateEntry(key string, fn func(e *Entry) error) error {
 // acquire them in ascending shard-index order, each shard once. With every
 // multi-lock path following one global order there can be no cycle of waiting
 // goroutines, so no deadlock. Single-key operations hold exactly one shard
-// lock and cannot take part in a cycle. The sweeper, Scan, RandomKey and Flush
-// also hold one lock at a time.
+// lock and cannot take part in a cycle. The sweeper, Scan and RandomKey hold
+// one lock at a time; FlushWith and BeginSnapshot lock every shard, in
+// ascending order, via withAllLocked.
 func (s *Store) lockOrder(keys []string) []int {
 	order := make([]int, len(keys))
 	for i, k := range keys {
@@ -392,6 +420,20 @@ func (s *Store) lockOrder(keys []string) []int {
 	return slices.Compact(order)
 }
 
+// withAllLocked runs fn while holding every shard's write lock, taken in
+// ascending index order and passing each through the copy-on-write gate.
+func (s *Store) withAllLocked(fn func() error) error {
+	for i := range s.shards {
+		s.shards[i].lockW()
+	}
+	defer func() {
+		for i := len(s.shards) - 1; i >= 0; i-- {
+			s.shards[i].mu.Unlock()
+		}
+	}()
+	return fn()
+}
+
 // Atomic runs fn with write access to all keys at once. It locks the involved
 // shards in ascending index order (see lockOrder), so concurrent Atomic and
 // AtomicView calls cannot deadlock. entries[i] is the handle for keys[i];
@@ -399,7 +441,7 @@ func (s *Store) lockOrder(keys []string) []int {
 func (s *Store) Atomic(keys []string, fn func(entries []*Entry) error) error {
 	order := s.lockOrder(keys)
 	for _, i := range order {
-		s.shards[i].mu.Lock()
+		s.shards[i].lockW()
 		if s.afterLock != nil {
 			s.afterLock()
 		}
@@ -481,7 +523,7 @@ func (s *Store) Get(key string) ([]byte, bool) {
 func (s *Store) Set(key string, value []byte) {
 	v := NewString(value) // copy outside the lock to keep the critical section short
 	sh := s.shardFor(key)
-	sh.mu.Lock()
+	sh.lockW()
 	sh.m[key] = v
 	sh.track(key)
 	delete(sh.exp, key)
@@ -495,7 +537,7 @@ func (s *Store) Delete(keys ...string) int {
 	n := 0
 	for _, k := range keys {
 		sh := s.shardFor(k)
-		sh.mu.Lock()
+		sh.lockW()
 		if s.liveLocked(sh, k, s.clock.NowMs()) != nil {
 			sh.remove(k)
 			n++
@@ -541,17 +583,28 @@ func (s *Store) Len() int {
 	return n
 }
 
-// Flush removes every key and TTL, shard by shard (not atomic across shards).
-func (s *Store) Flush() {
-	for i := range s.shards {
-		sh := &s.shards[i]
-		sh.mu.Lock()
-		sh.m = make(map[string]Value)
-		sh.exp = make(map[string]int64)
-		sh.pos = make(map[string]int)
-		sh.order = nil
-		sh.mu.Unlock()
-	}
+// Flush removes every key and TTL. See FlushWith.
+func (s *Store) Flush() { s.FlushWith(nil) }
+
+// FlushWith removes every key and TTL while holding every shard's write lock
+// (ascending order), and calls underLock, if non-nil, before releasing them.
+// Holding all locks makes the flush atomic across shards, which is what lets
+// FLUSHALL be logged once, in the right place relative to every other key's
+// records. underLock must follow the closure rules on Store.
+func (s *Store) FlushWith(underLock func()) {
+	_ = s.withAllLocked(func() error {
+		for i := range s.shards {
+			sh := &s.shards[i]
+			sh.m = make(map[string]Value)
+			sh.exp = make(map[string]int64)
+			sh.pos = make(map[string]int)
+			sh.order = nil
+		}
+		if underLock != nil {
+			underLock()
+		}
+		return nil
+	})
 }
 
 // Keys returns all live keys matching the Redis glob pattern. Shards are
@@ -593,7 +646,7 @@ func (s *Store) Keys(pattern string) []string {
 // the Store.
 func (s *Store) Update(key string, fn func(old []byte, exists bool) (newValue []byte, err error)) error {
 	sh := s.shardFor(key)
-	sh.mu.Lock()
+	sh.lockW()
 	defer sh.mu.Unlock() // also released if fn panics
 	cur := s.liveLocked(sh, key, s.clock.NowMs())
 	var arg []byte

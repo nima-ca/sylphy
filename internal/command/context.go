@@ -17,6 +17,11 @@ import (
 // need out of the closure and write the reply afterwards, so a slow client can
 // never stall a shard; a closure must not block, must not call back into the
 // Store, and must not retain the Values or Entries it is given.
+//
+// When persistence is on, a connection's Store is a journaling wrapper (see
+// Context.EnableJournal) that logs each write inside the closure's critical
+// section. A handler that writes must therefore record its effects in ctx.fx
+// inside the closure, before it returns, not after the Store call.
 type Store interface {
 	Get(key string) ([]byte, bool)
 	Set(key string, value []byte)
@@ -24,6 +29,9 @@ type Store interface {
 	Exists(keys ...string) int
 	Len() int
 	Flush()
+	// FlushWith empties the store while holding every shard lock and calls
+	// underLock, if non-nil, before releasing them.
+	FlushWith(underLock func())
 	Keys(pattern string) []string
 	Update(key string, fn func(old []byte, exists bool) ([]byte, error)) error
 
@@ -95,8 +103,9 @@ type Context struct {
 	Rand Rand
 
 	// Propagate asks Dispatch to fill Rewritten after each successful write
-	// command. It is off by default so that nothing is allocated until a
-	// consumer (the Phase 3 AOF) exists.
+	// command. It predates the journal and is kept for tests; the server logs
+	// through EnableJournal, which does the same work inside the critical
+	// section where the log order is still the apply order.
 	Propagate bool
 	// Rewritten holds the deterministic commands equivalent to the last
 	// Dispatch, ready to be logged: empty for reads, failed commands and
@@ -106,8 +115,15 @@ type Context struct {
 	// the connection.
 	Rewritten [][][]byte
 
+	// LastSeq is the sequence number of the newest log record this connection
+	// appended, 0 if none. With fsync "always" the server waits for it to be
+	// durable before it sends the replies of a pipelined batch.
+	LastSeq uint64
+
 	// fx is the scratch record for the write command being executed.
 	fx Effects
+	// journal is non-nil once EnableJournal has been called.
+	journal *journal
 }
 
 // intN returns a random integer in [0, n) from ctx.Rand, or from math/rand/v2

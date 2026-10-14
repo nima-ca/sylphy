@@ -59,8 +59,9 @@ func expireAllowed(flags int, when, cur int64, hasTTL bool) bool {
 
 // expireGeneric implements EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT. As in
 // Redis, options are parsed before the integer, and a deadline that is not in
-// the future deletes the key (reply 1). The deadline it applied is recorded in
-// ctx.fx for the PEXPIREAT rewrite.
+// the future deletes the key (reply 1). The deadline it applied, and whether it
+// deleted the key, are recorded in ctx.fx inside the critical section for the
+// PEXPIREAT/DEL rewrite.
 func expireGeneric(ctx *Context, args [][]byte, name string, unit timeUnit, absolute bool) error {
 	flags, err := parseExpireFlags(args[2:])
 	if err != nil {
@@ -84,12 +85,12 @@ func expireGeneric(ctx *Context, args [][]byte, name string, unit timeUnit, abso
 			return nil
 		}
 		changed = e.SetExpireAt(when)
+		ctx.fx = Effects{Applied: changed, DeadlineMs: when, Deleted: changed && !e.Exists()}
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	ctx.fx.Applied, ctx.fx.DeadlineMs = changed, when
 	if changed {
 		ctx.W.WriteInteger(1)
 	} else {
@@ -153,12 +154,12 @@ func cmdPersist(ctx *Context, args [][]byte) error {
 	var removed bool
 	err := ctx.Store.MutateEntry(string(args[0]), func(e *store.Entry) error {
 		removed = e.Exists() && e.Persist()
+		ctx.fx.Applied = removed
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	ctx.fx.Applied = removed
 	if removed {
 		ctx.W.WriteInteger(1)
 	} else {

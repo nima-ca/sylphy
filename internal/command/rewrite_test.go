@@ -83,6 +83,9 @@ func TestRewriteOutputs(t *testing.T) {
 		{"", []string{"SET", "k", "v", "NX", "XX"}},
 		{"LPUSH l a", []string{"LPUSH", "l", "a"}}, // deterministic: verbatim
 		{"", []string{"SET", "l", "v", "GET"}},     // WRONGTYPE
+		// A deadline that is already past leaves no key: logged as DEL, because
+		// replay runs with a frozen clock and would never delete by deadline.
+		{"DEL dp", []string{"SET", "dp", "v", "PXAT", "1"}},
 		// SETNX, SETEX, PSETEX.
 		{"SET a 1", []string{"SETNX", "a", "1"}},
 		{"", []string{"SETNX", "a", "2"}},
@@ -97,7 +100,7 @@ func TestRewriteOutputs(t *testing.T) {
 		{"", []string{"GETEX", "g"}},
 		{"", []string{"GETEX", "missing", "EX", "10"}},
 		{"", []string{"GETEX", "g", "EX", "abc"}},
-		{"PEXPIREAT g 1", []string{"GETEX", "g", "PXAT", "1"}}, // deleted: replays as the same deletion
+		{"DEL g", []string{"GETEX", "g", "PXAT", "1"}}, // deleted by its deadline: logged as DEL
 		{"", []string{"GETEX", "g", "EX", "10"}},
 		// GETDEL becomes DEL.
 		{"SET d v", []string{"SET", "d", "v"}},
@@ -113,7 +116,7 @@ func TestRewriteOutputs(t *testing.T) {
 		{"PEXPIREAT e 1700000600000", []string{"PEXPIREAT", "e", "1700000600000"}},
 		{"", []string{"EXPIRE", "missing", "10"}},
 		{"", []string{"EXPIRE", "e", "10", "GT"}}, // condition not met
-		{"PEXPIREAT e 1000", []string{"EXPIREAT", "e", "1"}},
+		{"DEL e", []string{"EXPIREAT", "e", "1"}}, // deleted by its deadline: logged as DEL
 		{"", []string{"EXPIRE", "e", "10"}},
 		{"", []string{"EXPIRE", "e", "x"}},
 		// PERSIST.

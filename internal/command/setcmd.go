@@ -76,7 +76,8 @@ func parseSetOptions(args [][]byte, now int64) (setOptions, error) {
 // cmdSet implements SET key value [NX|XX] [GET] [EX|PX|EXAT|PXAT n|KEEPTTL].
 // Plain SET takes the unconditional fast path; anything with options runs as
 // one critical section so GET/NX/XX/TTL changes are atomic. The outcome and
-// the applied deadline are recorded in ctx.fx for the rewrite hook.
+// the applied deadline are recorded in ctx.fx, inside that critical section,
+// for the rewrite hook.
 func cmdSet(ctx *Context, args [][]byte) error {
 	key := string(args[0])
 	if len(args) == 2 {
@@ -111,13 +112,16 @@ func cmdSet(ctx *Context, args [][]byte) error {
 		if o.hasExpire {
 			e.SetExpireAt(o.expireAt) // a deadline in the past deletes the key
 		}
+		ctx.fx = Effects{
+			Applied: true, KeepTTL: o.keepTTL, HasDeadline: o.hasExpire, DeadlineMs: o.expireAt,
+			Deleted: o.hasExpire && !e.Exists(),
+		}
 		applied = true
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	ctx.fx = Effects{Applied: applied, KeepTTL: o.keepTTL, HasDeadline: o.hasExpire, DeadlineMs: o.expireAt}
 	switch {
 	case o.get && hadOld:
 		ctx.W.WriteBulk(old)
@@ -139,13 +143,13 @@ func cmdSetNX(ctx *Context, args [][]byte) error {
 			return nil
 		}
 		e.Put(nv)
+		ctx.fx.Applied = true
 		set = true
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	ctx.fx.Applied = set
 	if set {
 		ctx.W.WriteInteger(1)
 	} else {
@@ -165,12 +169,14 @@ func setWithTTL(ctx *Context, args [][]byte, name string, unit timeUnit) error {
 		e.Put(nv)
 		e.Persist()
 		e.SetExpireAt(at)
+		// The store's clock may have moved past a very short TTL since the
+		// deadline was computed; then the key is already gone.
+		ctx.fx = Effects{Applied: true, HasDeadline: true, DeadlineMs: at, Deleted: !e.Exists()}
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	ctx.fx = Effects{Applied: true, HasDeadline: true, DeadlineMs: at}
 	ctx.W.WriteSimpleString("OK")
 	return nil
 }
@@ -222,12 +228,15 @@ func cmdGetEX(ctx *Context, args [][]byte) error {
 		if out, found, err = stringOf(e.Value()); err != nil || !found {
 			return err
 		}
+		fx := Effects{Applied: true, Persist: persist, HasDeadline: hasExpire, DeadlineMs: at}
 		switch {
 		case persist:
 			e.Persist()
 		case hasExpire:
 			e.SetExpireAt(at)
+			fx.Deleted = !e.Exists()
 		}
+		ctx.fx = fx
 		return nil
 	})
 	if err != nil {
@@ -237,7 +246,6 @@ func cmdGetEX(ctx *Context, args [][]byte) error {
 		ctx.W.WriteNullBulk()
 		return nil
 	}
-	ctx.fx = Effects{Applied: true, Persist: persist, HasDeadline: hasExpire, DeadlineMs: at}
 	ctx.W.WriteBulk(out)
 	return nil
 }
@@ -252,6 +260,7 @@ func cmdGetDel(ctx *Context, args [][]byte) error {
 			return err
 		}
 		e.Delete()
+		ctx.fx.Applied = true
 		return nil
 	})
 	if err != nil {
@@ -261,7 +270,6 @@ func cmdGetDel(ctx *Context, args [][]byte) error {
 		ctx.W.WriteNullBulk()
 		return nil
 	}
-	ctx.fx.Applied = true
 	ctx.W.WriteBulk(out)
 	return nil
 }

@@ -27,9 +27,12 @@ func NewDispatcher(reg *Registry, log *slog.Logger) *Dispatcher {
 // It never returns an error: every failure becomes a RESP error reply. Reply
 // write errors are surfaced later by Writer.Flush.
 //
-// If ctx.Propagate is set, a write command that succeeded leaves its
-// deterministic form in ctx.Rewritten (see RewriteFunc); in every other case
-// ctx.Rewritten is empty after the call.
+// If the context has a journal (EnableJournal), a write command is first
+// refused with a MISCONF error while persistence is in its error state, then
+// waits for room in the log, and its records are appended inside the critical
+// section that applies it. If ctx.Propagate is set, a write command that
+// succeeded leaves its deterministic form in ctx.Rewritten (see RewriteFunc);
+// in every other case ctx.Rewritten is empty after the call.
 func (d *Dispatcher) Dispatch(ctx *Context, argv [][]byte) {
 	ctx.Rewritten = nil
 	if len(argv) == 0 {
@@ -47,6 +50,13 @@ func (d *Dispatcher) Dispatch(ctx *Context, argv [][]byte) {
 	isWrite := spec.Flags&FlagWrite != 0
 	if isWrite {
 		ctx.fx = Effects{}
+		if j := ctx.journal; j != nil {
+			if err := j.begin(spec, argv); err != nil {
+				ctx.W.WriteError(err.Msg)
+				return
+			}
+			defer j.end()
+		}
 	}
 	if err := spec.Handler(ctx, argv[1:]); err != nil {
 		var re *ReplyError
