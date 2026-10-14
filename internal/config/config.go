@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nima-ca/sylphy/internal/protocol"
@@ -45,6 +47,29 @@ type Config struct {
 	MaxArrayLen  int64
 	MaxInlineLen int
 	MaxDepth     int
+
+	// PersistenceMode is off (the default: nothing is written to disk),
+	// snapshot (checkpoints only: SAVE, BGSAVE and shutdown) or aof (every write
+	// is logged, plus checkpoints).
+	PersistenceMode string
+	// Dir is the data directory used when PersistenceMode is not off.
+	Dir string
+	// AppendFsync is the AOF fsync policy: always, everysec or no. It only
+	// matters in aof mode.
+	AppendFsync string
+	// AutoRewritePercentage triggers a checkpoint when the log has grown by this
+	// percentage over the base snapshot; 0 disables the automatic trigger.
+	AutoRewritePercentage int
+	// AutoRewriteMinSize is the smallest base plus log size, in bytes, at which
+	// the automatic trigger may fire.
+	AutoRewriteMinSize int64
+	// AOFLoadTruncated repairs a partial record at the end of the last log
+	// segment at startup instead of refusing to start.
+	AOFLoadTruncated bool
+	// SnapshotOnShutdown is auto, true or false: whether shutdown takes a final
+	// checkpoint. Auto means yes whenever persistence is on. It is a string so
+	// that Config stays comparable.
+	SnapshotOnShutdown string
 }
 
 // Default returns the default configuration.
@@ -68,6 +93,14 @@ func Default() Config {
 		MaxArrayLen:          l.MaxArrayLen,
 		MaxInlineLen:         l.MaxInlineLen,
 		MaxDepth:             l.MaxDepth,
+
+		PersistenceMode:       "off",
+		Dir:                   "./data",
+		AppendFsync:           "everysec",
+		AutoRewritePercentage: 100,
+		AutoRewriteMinSize:    64 << 20,
+		AOFLoadTruncated:      true,
+		SnapshotOnShutdown:    "auto",
 	}
 }
 
@@ -93,6 +126,21 @@ func (c Config) SlogLevel() slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// PersistenceEnabled reports whether anything is persisted to disk.
+func (c Config) PersistenceEnabled() bool { return c.PersistenceMode != "off" }
+
+// SnapshotOnShutdownEnabled resolves SnapshotOnShutdown: true and false are
+// taken as they are, and auto means on whenever persistence is on.
+func (c Config) SnapshotOnShutdownEnabled() bool {
+	switch c.SnapshotOnShutdown {
+	case "true":
+		return true
+	case "false":
+		return false
+	}
+	return c.PersistenceEnabled()
 }
 
 // Validate reports every problem with c, joined into one error.
@@ -144,7 +192,87 @@ func (c Config) Validate() error {
 		add("protocol limits (max-bulk-len, max-array-len, max-inline-len, max-depth) must be positive")
 	}
 
+	switch c.PersistenceMode {
+	case "off", "snapshot", "aof":
+	default:
+		add("persistence-mode must be off, snapshot or aof, got %q", c.PersistenceMode)
+	}
+	switch c.AppendFsync {
+	case "always", "everysec", "no":
+	default:
+		add("append-fsync must be always, everysec or no, got %q", c.AppendFsync)
+	}
+	if c.AutoRewritePercentage < 0 {
+		add("auto-rewrite-percentage must not be negative, got %d", c.AutoRewritePercentage)
+	}
+	if c.AutoRewriteMinSize < 0 {
+		add("auto-rewrite-min-size must not be negative, got %d", c.AutoRewriteMinSize)
+	}
+	switch c.SnapshotOnShutdown {
+	case "auto", "false":
+	case "true":
+		if c.PersistenceMode == "off" {
+			add("snapshot-on-shutdown=true needs persistence-mode snapshot or aof")
+		}
+	default:
+		add("snapshot-on-shutdown must be auto, true or false, got %q", c.SnapshotOnShutdown)
+	}
+	if c.PersistenceEnabled() && strings.TrimSpace(c.Dir) == "" {
+		add("dir must not be empty when persistence is on")
+	}
+
 	return errors.Join(errs...)
+}
+
+// ParseSize parses a byte count: a plain integer, or an integer with a binary
+// suffix (k, kb, kib, m, mb, mib, g, gb, gib, b), case-insensitive. All
+// suffixes are powers of 1024.
+func ParseSize(s string) (int64, error) {
+	t := strings.ToLower(strings.TrimSpace(s))
+	mult := int64(1)
+	for _, u := range []struct {
+		suffix string
+		mult   int64
+	}{
+		{"kib", 1 << 10}, {"mib", 1 << 20}, {"gib", 1 << 30},
+		{"kb", 1 << 10}, {"mb", 1 << 20}, {"gb", 1 << 30},
+		{"k", 1 << 10}, {"m", 1 << 20}, {"g", 1 << 30}, {"b", 1},
+	} {
+		if strings.HasSuffix(t, u.suffix) {
+			t, mult = strings.TrimSpace(strings.TrimSuffix(t, u.suffix)), u.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(t, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q (want a number of bytes, optionally with a k, m or g suffix)", s)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("invalid size %q: must not be negative", s)
+	}
+	if n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("invalid size %q: too large", s)
+	}
+	return n * mult, nil
+}
+
+// sizeFlag is a flag.Value for byte sizes.
+type sizeFlag struct{ p *int64 }
+
+func (f sizeFlag) String() string {
+	if f.p == nil {
+		return "0"
+	}
+	return strconv.FormatInt(*f.p, 10)
+}
+
+func (f sizeFlag) Set(s string) error {
+	v, err := ParseSize(s)
+	if err != nil {
+		return err
+	}
+	*f.p = v
+	return nil
 }
 
 // Load builds a Config from defaults, then SYLPHY_* environment variables (via
@@ -173,6 +301,13 @@ func Load(args []string, getenv func(string) string, out io.Writer) (Config, err
 	fs.Int64Var(&cfg.MaxArrayLen, "max-array-len", cfg.MaxArrayLen, "max array elements (env SYLPHY_MAX_ARRAY_LEN)")
 	fs.IntVar(&cfg.MaxInlineLen, "max-inline-len", cfg.MaxInlineLen, "max inline line bytes (env SYLPHY_MAX_INLINE_LEN)")
 	fs.IntVar(&cfg.MaxDepth, "max-depth", cfg.MaxDepth, "max array nesting (env SYLPHY_MAX_DEPTH)")
+	fs.StringVar(&cfg.PersistenceMode, "persistence-mode", cfg.PersistenceMode, "off|snapshot|aof (env SYLPHY_PERSISTENCE_MODE)")
+	fs.StringVar(&cfg.Dir, "dir", cfg.Dir, "data directory for snapshots and the append-only file (env SYLPHY_DIR)")
+	fs.StringVar(&cfg.AppendFsync, "append-fsync", cfg.AppendFsync, "always|everysec|no, aof mode only (env SYLPHY_APPEND_FSYNC)")
+	fs.IntVar(&cfg.AutoRewritePercentage, "auto-rewrite-percentage", cfg.AutoRewritePercentage, "checkpoint when the log has grown this percent over the base snapshot, 0=never (env SYLPHY_AUTO_REWRITE_PERCENTAGE)")
+	fs.Var(sizeFlag{&cfg.AutoRewriteMinSize}, "auto-rewrite-min-size", "smallest base+log size in bytes (suffixes k, m, g allowed) that may trigger a checkpoint (env SYLPHY_AUTO_REWRITE_MIN_SIZE)")
+	fs.BoolVar(&cfg.AOFLoadTruncated, "aof-load-truncated", cfg.AOFLoadTruncated, "repair a partial last log record at startup instead of refusing to start (env SYLPHY_AOF_LOAD_TRUNCATED)")
+	fs.StringVar(&cfg.SnapshotOnShutdown, "snapshot-on-shutdown", cfg.SnapshotOnShutdown, "auto|true|false: final checkpoint at shutdown; auto means whenever persistence is on (env SYLPHY_SNAPSHOT_ON_SHUTDOWN)")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -217,6 +352,12 @@ func applyEnv(cfg *Config, getenv func(string) string) error {
 	durVar := func(name string, dst *time.Duration) {
 		parse(name, func(v string) (err error) { *dst, err = time.ParseDuration(v); return })
 	}
+	sizeVar := func(name string, dst *int64) {
+		parse(name, func(v string) (err error) { *dst, err = ParseSize(v); return })
+	}
+	boolVar := func(name string, dst *bool) {
+		parse(name, func(v string) (err error) { *dst, err = strconv.ParseBool(v); return })
+	}
 
 	str("SYLPHY_ADDR", &cfg.Addr)
 	str("SYLPHY_LOG_LEVEL", &cfg.LogLevel)
@@ -233,5 +374,12 @@ func applyEnv(cfg *Config, getenv func(string) string) error {
 	durVar("SYLPHY_EXPIRE_CYCLE_BUDGET", &cfg.ExpireCycleBudget)
 	intVar("SYLPHY_EXPIRE_SAMPLE_SIZE", &cfg.ExpireSampleSize)
 	floatVar("SYLPHY_EXPIRE_STALE_THRESHOLD", &cfg.ExpireStaleThreshold)
+	str("SYLPHY_PERSISTENCE_MODE", &cfg.PersistenceMode)
+	str("SYLPHY_DIR", &cfg.Dir)
+	str("SYLPHY_APPEND_FSYNC", &cfg.AppendFsync)
+	intVar("SYLPHY_AUTO_REWRITE_PERCENTAGE", &cfg.AutoRewritePercentage)
+	sizeVar("SYLPHY_AUTO_REWRITE_MIN_SIZE", &cfg.AutoRewriteMinSize)
+	boolVar("SYLPHY_AOF_LOAD_TRUNCATED", &cfg.AOFLoadTruncated)
+	str("SYLPHY_SNAPSHOT_ON_SHUTDOWN", &cfg.SnapshotOnShutdown)
 	return errors.Join(errs...)
 }

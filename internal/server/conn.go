@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -21,26 +22,48 @@ type conn struct {
 	state  *command.ConnState
 	cmdCtx *command.Context
 
+	// ctx ends with the connection; it bounds how long a write may wait for
+	// room in the log. gate is non-nil when replies wait for durability.
+	ctx    context.Context
+	cancel context.CancelFunc
+	gate   *durableWriter
+
 	mu       sync.Mutex // guards draining and serializes deadline updates with drain()
 	draining bool
 }
 
+// newConn builds a connection's state. The caller holds s.mu (or is a test).
 func (s *Server) newConn(nc net.Conn) *conn {
 	state := &command.ConnState{ID: s.nextID.Add(1)}
-	wr := protocol.NewWriter(nc)
-	return &conn{
-		srv:   s,
-		nc:    nc,
-		rd:    protocol.NewReader(nc, s.limits),
-		wr:    wr,
-		state: state,
-		cmdCtx: &command.Context{
-			Store:  s.store,
-			W:      wr,
-			Config: &s.cfg,
-			Conn:   state,
-		},
+	cctx, cancel := context.WithCancel(context.Background())
+	c := &conn{
+		srv:    s,
+		nc:     nc,
+		rd:     protocol.NewReader(nc, s.limits),
+		state:  state,
+		ctx:    cctx,
+		cancel: cancel,
 	}
+	var out io.Writer = nc
+	if s.prop != nil && s.waitDurable {
+		c.gate = &durableWriter{w: nc, prop: s.prop, base: cctx}
+		out = c.gate
+	}
+	c.wr = protocol.NewWriter(out)
+	c.cmdCtx = &command.Context{
+		Store:   s.store,
+		W:       c.wr,
+		Config:  &s.cfg,
+		Conn:    state,
+		Persist: s.persist,
+	}
+	if c.gate != nil {
+		c.gate.ctx = c.cmdCtx
+	}
+	if s.prop != nil {
+		c.cmdCtx.EnableJournal(cctx, s.prop)
+	}
+	return c
 }
 
 // drain marks the connection as draining and wakes any blocked read. Holding mu
@@ -83,6 +106,7 @@ func (c *conn) serve() {
 			s.log.Error("panic in connection handler; closing connection",
 				"id", id, "panic", r, "stack", string(debug.Stack()))
 		}
+		c.cancel()
 		_ = c.nc.Close()
 		s.log.Debug("connection closed", "id", id)
 	}()
@@ -99,6 +123,15 @@ func (c *conn) serve() {
 			return
 		}
 		s.disp.Dispatch(c.cmdCtx, args)
+		if err := c.cmdCtx.JournalErr(); err != nil {
+			// The command was applied but its record was refused. Where replies
+			// wait for durability (fsync always) this connection must not
+			// acknowledge it, so its pending replies are dropped.
+			s.log.Error("a write was applied but could not be logged", "id", id, "err", err)
+			if c.gate != nil {
+				c.gate.fail(err)
+			}
+		}
 		if c.state.Closing {
 			_ = c.flush()
 			return

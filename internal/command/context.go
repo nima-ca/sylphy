@@ -1,7 +1,10 @@
 package command
 
 import (
+	"context"
+	"errors"
 	"math/rand/v2"
+	"time"
 
 	"github.com/nima-ca/sylphy/internal/config"
 	"github.com/nima-ca/sylphy/internal/protocol"
@@ -65,6 +68,23 @@ type Store interface {
 
 var _ Store = (*store.Store)(nil)
 
+// ErrCheckpointRunning is returned by a Persistence when a checkpoint is
+// already in progress.
+var ErrCheckpointRunning = errors.New("a checkpoint is already in progress")
+
+// Persistence is what the SAVE family of commands needs from the persistence
+// layer. A nil Persistence in the Context means persistence is off.
+type Persistence interface {
+	// Save runs a checkpoint and returns when it is committed.
+	Save(ctx context.Context) error
+	// BGSave starts a checkpoint in the background and returns at once.
+	BGSave() error
+	// LastSave returns when persistence last reached a checkpoint.
+	LastSave() time.Time
+	// AOFEnabled reports whether writes are logged to an append-only file.
+	AOFEnabled() bool
+}
+
 // Rand supplies random integers to handlers (SPOP, SRANDMEMBER, ...).
 // *rand.Rand from math/rand/v2 implements it, which is how tests inject a
 // seeded generator.
@@ -97,6 +117,8 @@ type Context struct {
 	Config *config.Config
 	// Conn is the per-connection state.
 	Conn *ConnState
+	// Persist is the persistence layer, or nil when persistence is off.
+	Persist Persistence
 	// Rand is the source of randomness; nil means the goroutine-safe
 	// top-level functions of math/rand/v2. Because a Context belongs to one
 	// connection goroutine, a non-thread-safe generator is fine here.
