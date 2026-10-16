@@ -227,6 +227,8 @@ count expired keys, which was rejected.
 
 ## ADR-018: Rewrite hooks for a future append-only log
 
+**Status.** Implemented in Phase 3: see ADR-020, ADR-022 and ADR-028.
+
 **Context.** Phase 3 will log write commands and replay them. Replaying the
 original argv is wrong when a command depends on the clock (`EXPIRE 10`), on
 randomness (`SPOP`), or on state the replay may not see identically (`SET ... NX
@@ -249,3 +251,220 @@ output never aliases the request buffers; verbatim entries do and must be used o
 copied before the next read. Expiry-driven deletions are not write commands and
 are not hooked; Phase 3 must log a `DEL` when lazy or active expiry removes a key,
 and must define how log order matches store order across connections.
+
+## ADR-019: One checkpoint procedure
+
+**Context.** A point-in-time snapshot (`BGSAVE`) and a rewrite that shrinks the
+log (`BGREWRITEAOF`) are usually separate procedures. Sylphy's log is a base
+snapshot plus segments listed in a manifest, so writing a new base and starting
+a fresh segment does both jobs.
+**Decision.** One procedure, `Manager.checkpoint`, serves `SAVE`, `BGSAVE`,
+`BGREWRITEAOF`, the automatic trigger, the shutdown checkpoint and the healing of
+a failed log. Steps: barrier and log rotation under every shard lock; the base
+is written outside the locks to a temporary file, fsynced, renamed and its
+directory synced; the manifest is committed (its rename is the commit point);
+the retired base and segments are deleted. Only one checkpoint runs at a time
+(`ErrCheckpointRunning`). In `aof` mode a once-a-second trigger starts one when
+the log has grown by `auto-rewrite-percentage` over the base and base plus log
+has reached `auto-rewrite-min-size`, or when the log is in its error state; after
+a failed checkpoint it waits ten ticks.
+**Consequences.** `BGREWRITEAOF` is `BGSAVE` with different reply strings, and
+`snapshot` mode refuses it. A checkpoint needs room for a complete new base next
+to the old files. A crash at any step leaves a consistent directory: the old
+manifest, an intermediate one that also lists the new segment, or the new one;
+leftover files are unlisted and recovery deletes them. In `aof` mode the
+manifest generation rises by two per checkpoint (segment listing, then commit).
+A checkpoint is the only way out of the error latch (ADR-025). The log is never
+shortened in place, so its growth is bounded only by the trigger.
+
+## ADR-020: Logging under the shard lock through a journaling store
+
+**Context.** Replay must reproduce the original order of writes to every key. If
+a record were appended after the shard lock was released, another write to the
+same key could be applied and logged in between.
+**Decision.** In `aof` mode each connection's store is wrapped in a `journal`
+that implements the same `Store` interface. Closure methods (`Mutate`,
+`MutateEntry`, `Atomic`, `Update`) append the command's rewrite (or the request
+verbatim) inside the closure, after the handler succeeded and recorded its
+effects, so the shard lock(s) are still held. The primitives log fixed forms:
+`Set` logs `SET key value`, `Delete` logs `DEL key` for each key that existed and
+`Flush` logs `FLUSHALL`. Before a write handler runs, `begin` refuses it with
+`MISCONF` if persistence has failed and calls `Admit` outside any lock.
+`AOF.Append` assigns sequence numbers under the AOF mutex, never blocks and does
+no I/O, which is what makes it legal under a shard lock (ADR-010's closure
+rules).
+**Consequences.** For every key, log order equals apply order. A multi-key
+command holds all its shards (ADR-015) while its records are appended as one
+contiguous group. Commands on different shards interleave in the file in the
+order of their `Append` calls; they touch disjoint keys. `MSET` logs one `SET`
+per pair and `DEL` one `DEL` per key that existed, matching their per-key
+atomicity (ADR-005). The lock order becomes shard locks, then the AOF mutex. If
+`Append` fails after the change was applied, the change cannot be undone; see
+ADR-025.
+
+## ADR-021: Shard-granular copy-on-write snapshots
+
+**Context.** A checkpoint needs a consistent point-in-time copy of the whole
+dataset without stopping writers for the duration of a disk write. Go has no
+`fork`.
+**Decision.** `Store.BeginSnapshot` locks every shard in ascending order, runs a
+caller-supplied barrier, marks every shard pending and unlocks. Each shard is
+then serialized exactly once, from its state at the barrier, under its own lock,
+by whichever comes first: `Snapshot.Drain`, which walks the shards in order under
+the read lock, or the first writer that reaches the shard (the gate in `lockW`,
+which every write-lock acquisition must use; a test enforces it). A writer
+locking several shards gates all of them first. The encoder runs under the lock,
+must not block or retain what it is given, and copies into the block.
+The barrier and the log rotation are split: the barrier only marks the
+rotation boundary in the AOF's memory buffer (no I/O), because it runs under
+every shard lock. The I/O (fsync the old segment, create and list the new one)
+happens after unlock, when the checkpoint waits on the rotation. Everything
+before the boundary is in the old segments, everything after it is in the new
+segment, and the base is the state at the boundary.
+**Consequences.** The pause is O(shards) plus the in-memory barrier. A writer
+that reaches a pending shard pays for serializing that shard under its lock, and
+blocks serialized ahead of the drain stay in memory until written, so memory can
+approach the encoded size of the dataset. Only one snapshot exists at a time
+(`ErrSnapshotActive`). Expired but unreaped keys are serialized as they are;
+recovery decides what to do with them (ADR-022). A single entry too large for a
+block (1 GiB) fails the checkpoint. `Snapshot.Close` uses a plain lock so that
+ending the snapshot never serializes a shard.
+
+## ADR-022: Frozen-clock replay and logging expiry as DEL
+
+**Context.** ADR-018 left two problems for Phase 3: expiry removes keys without
+any write command, and replaying a log after downtime must not depend on how long
+the server was down.
+**Decision.** Recovery runs before the listener and the sweeper start and calls
+`Target.BeginReplay`, which freezes the store clock at 0: no deadline is in the
+past, nothing expires, so the base and the segments replay exactly as they were
+written. Segments replay through the normal dispatcher with a loader client (raw
+store, no propagation); a command that replies with an error stops startup. In
+`aof` mode a hook installed by `Manager.Start` logs `DEL key` inside the shard
+lock for each key that expiry removes, so the `DEL` sits at the key's own place
+in the log. Recovery does not purge expired keys. `Start` does, after the log is
+open and the hook is installed, and in `aof` mode it fsyncs the logged `DEL`s
+before it returns. In `snapshot` mode the purge is in memory.
+**Consequences.** Keys that expired during downtime occupy memory until `Start`
+runs. Logging the purge matters: without it, a later write to such a key would
+replay on top of the stale copy still stored in the base. The sweeper starts
+only after the purge, so it never appends before the hook exists. The hook
+ignores `Append` errors; a `DEL` lost to a latched log is covered by the
+checkpoint that heals it, whose base reflects memory.
+
+## ADR-023: Snapshot, manifest and log formats
+
+**Context.** The files must survive crashes and corruption, load into a store
+with any shard count and be readable by existing tools where possible.
+**Decision.** Three formats, all versioned. The snapshot is binary and
+little-endian: a header, blocks of entries (each with its own CRC-32C) and an end
+record carrying entry and block counts and a whole-file CRC. Nothing in it
+depends on shard count or key order, and scores are stored as the IEEE-754 bits.
+The manifest is text: magic and version, a generation, an optional base (name,
+size, CRC) and the segments in replay order, ending in a CRC line; numbers are
+canonical, so a decoded manifest re-encodes to the same bytes. Log segments are
+plain RESP arrays of bulk strings, one command per record, with no checksum:
+a stricter reader validates them by parsing (canonical decimals, no inline
+commands, no null bulks, no empty arrays). Decoders never panic and never trust
+a length field: memory follows the bytes actually present. A checksum is checked
+before a version, so damage is `ErrChecksum` and only an intact file of another
+version is `ErrVersion`.
+**Consequences.** Snapshots load under any `-shards` and any hash seed (ADR-003).
+Corruption inside a log bulk string that still parses goes unnoticed; only the
+base and the manifest are checksummed. A zero-filled tail of the last segment is
+corrupt, not truncated, so it is not repaired. Newer formats are refused and
+there is no migration.
+
+## ADR-024: Fsync policies, group commit and the flusher
+
+**Context.** Acknowledging a write only after an fsync is safe but slow if every
+write pays for its own; fsync-ing in the background is fast but loses a window.
+**Decision.** One flusher goroutine owns the active segment. Appends are cheap
+memory copies; the flusher takes everything appended since its last cycle as one
+batch, writes it, and fsyncs per `append-fsync`: `always` after every batch,
+`everysec` on a one-second tick if anything was written, `no` never on its own.
+Rotation, `Close` and an explicit `WaitDurable` fsync whatever the policy. With
+`always` the server holds a connection's replies until `WaitDurable` returns for
+its records, so one fsync covers every record appended while the previous one
+ran. A failed write is cut back to the last complete write; a failed fsync is
+never retried, because the kernel may already have dropped the dirty pages and a
+later success would prove nothing.
+**Consequences.** `always` loses no acknowledged write (if the disk honors
+fsync); `everysec` loses about a second on an OS or power crash (more on a slow
+disk); `no` leaves it to the OS. The policy only affects `aof` mode. A single
+flusher keeps the file order equal to the sequence order and the code simple;
+it is also the one place that does log I/O, which keeps `Append` free of it.
+
+## ADR-025: Admit backpressure and the error latch
+
+**Context.** `Append` never blocks, so a fast writer can outrun a slow disk, and
+a failed write or fsync means the log can no longer be trusted.
+**Decision.** `Admit` blocks, outside any lock, while buffered bytes are at or
+above the high-water mark (32 MiB, not configurable). The bound is soft:
+records already admitted can exceed it. A failed write or fsync latches the AOF:
+`Append`, `Admit` and `WaitDurable` fail until a healing checkpoint or a restart;
+every write command gets the `MISCONF` reply, while reads and admin commands keep
+working. Records accepted but never written are dropped and logged, never
+silently. A checkpoint taken while latched abandons the untrusted segment, starts
+a fresh unlisted one, writes a new base from memory, commits the manifest and only
+then clears the latch. The automatic trigger fires whenever the log is latched.
+If `Append` fails after the command was applied (the log latched between `Admit`
+and `Append`), the client gets `MISCONF` instead of the reply for closure
+commands, `Update` leaves the key untouched, and in-place `Mutate` and
+`MutateEntry` changes stay in memory until the healing checkpoint.
+**Consequences.** Memory and log can differ while latched; the healing base
+makes them agree again. If the process dies first, the change is lost like any
+non-durable write. The primitives (`Set`, `Delete`, `Flush`) cannot return the
+error to their handler; the failure is kept for `JournalErr` and further writes
+are refused. Healing needs disk space for a full base.
+
+## ADR-026: A file-system seam with an adversarial in-memory implementation
+
+**Context.** Crash safety depends on the order of write, fsync, rename and
+directory sync, which real disks make hard to test.
+**Decision.** All persistence I/O goes through an `FS` interface. `OSFS` is the
+real implementation; `MemFS` models failure adversarially: file bytes are durable
+only after `Sync`, and a created, renamed or removed directory entry only after
+`SyncDir`. It can fail or "crash" at the n-th mutating operation, and `Crash`
+returns the disk image a power loss at that moment could leave. Time is injected
+the same way (a `Ticker` for the flusher and the trigger, `Now` for `LastSave`).
+**Consequences.** Tests can cut a checkpoint, a rotation or a recovery at every
+mutating step, deterministically. The guarantees are only as good as the model.
+`OSFS.SyncDir` is a no-op on Windows, which cannot open directories for syncing,
+so directory-entry durability is not guaranteed there.
+
+## ADR-027: Persistence modes
+
+**Context.** Not every deployment wants a log, and the in-memory default must
+stay free.
+**Decision.** `persistence-mode` is `off` (default), `snapshot` or `aof`. `off`
+creates no manager and never touches the directory. `snapshot` writes
+checkpoints on `SAVE`, `BGSAVE` and at shutdown, keeps no log, runs no
+automatic trigger and never refuses writes. `aof` adds the log, the fsync
+policy, the automatic trigger, `Admit` and the latch. `snapshot-on-shutdown` is
+`auto` (on whenever persistence is on), `true` or `false`; it is a string so that
+`Config` stays comparable. `append-fsync` and the auto-rewrite settings matter
+only in `aof` mode.
+**Consequences.** Switching `snapshot` to `aof` works (a segment is created and
+listed at start). Switching `aof` to `snapshot` replays the existing segments at
+the next start and the next checkpoint drops them, with new writes unlogged in
+between. Switching to `off` leaves the directory stale, and switching back later
+loads whatever was last there.
+
+## ADR-028: Rewrite hooks consumed inside the critical section
+
+**Context.** ADR-018 had `Dispatch` compute the rewritten form after the handler
+returned. For a log, the record must be produced while the shard lock is still
+held (ADR-020).
+**Decision.** The journal calls `Spec.rewritten` from inside the closure of
+`Mutate`, `MutateEntry`, `Atomic` and `Update`, after the handler's closure
+succeeded and recorded its effects in `ctx.fx`. A hook may return several
+commands; they are appended as one contiguous group. A write command without a
+hook is logged verbatim. If the handler's closure returns an error, nothing is
+logged. The record is encoded into a reused per-connection buffer within the
+critical section, so verbatim entries are copied before the next read. The
+primitives bypass the hooks and log their fixed forms (ADR-020).
+**Consequences.** Hooks must keep recording effects inside the closure. The test
+that requires every write command to be hooked or on the audited deterministic
+list still guards new commands. Expiry deletions are logged by the hook of
+ADR-022, not by a command hook.

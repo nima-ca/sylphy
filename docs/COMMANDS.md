@@ -160,11 +160,48 @@ Start with cursor `0`; call again with the returned cursor until it is `0`.
   not an unsigned 64-bit decimal; a stale but well-formed cursor is accepted.
   `COUNT 0` and negative counts are `ERR syntax error`.
 
+## Persistence
+
+Admin commands. They need `-persistence-mode snapshot` or `aof` (see
+[PERSISTENCE.md](PERSISTENCE.md)), are never written to the log, and keep
+working while the log is in its error state, because a checkpoint is how it
+recovers. Only one checkpoint runs at a time.
+
+| Command      | Syntax         | Returns                                          | Complexity                                     | Notes                                                                                                                                                                                                                                              |
+| ------------ | -------------- | ------------------------------------------------ | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SAVE         | `SAVE`         | `+OK` once the checkpoint is committed           | O(data); the barrier pause is O(S)             | Blocks only the calling connection; other clients are served. A checkpoint already running: `ERR Background save already in progress`                                                                                                              |
+| BGSAVE       | `BGSAVE`       | `+Background saving started`                     | O(S) for the caller; O(data) in the background | Same error as `SAVE` when a checkpoint is running. Takes no arguments (Redis's `BGSAVE SCHEDULE` is not accepted)                                                                                                                                  |
+| BGREWRITEAOF | `BGREWRITEAOF` | `+Background append only file rewriting started` | as `BGSAVE`                                    | **Triggers the same checkpoint as `BGSAVE`**: a new base snapshot plus a fresh log segment. There is no separate log-only rewrite. Needs `aof` mode. A checkpoint already running: `ERR Background append only file rewriting already in progress` |
+| LASTSAVE     | `LASTSAVE`     | integer: Unix seconds                            | O(1)                                           | Time of the last checkpoint, or of process start if there has been none in this process. `0` when persistence is off                                                                                                                               |
+
+Errors:
+
+- Persistence off (`SAVE`, `BGSAVE`, `BGREWRITEAOF`): `ERR persistence is disabled; start the server with -persistence-mode snapshot or aof`.
+- `BGREWRITEAOF` in `snapshot` mode: `ERR the append-only file is not enabled; start the server with -persistence-mode aof`.
+
+### MISCONF
+
+In `aof` mode a failed log write or fsync latches the log. Every write command
+is then refused with
+
+```
+MISCONF Sylphy is unable to persist writes to disk, so commands that may modify the data set are disabled. Check the server logs for details.
+```
+
+Reads and the commands above keep working. The same reply is sent when the
+log cannot admit a write for any other reason (a cancelled connection, a closed
+log). A checkpoint (`SAVE`, `BGSAVE`, `BGREWRITEAOF`, or the automatic trigger,
+which fires whenever the log is latched) clears the latch. If the log latches
+after a command was applied but before it was logged, the client gets
+`MISCONF` although the change is in memory; see
+[PERSISTENCE.md](PERSISTENCE.md#error-latch-misconf-and-admit).
+
 ## Errors
 
 - Unknown command: `ERR unknown command 'foo', with args beginning with: 'a' 'b' `.
 - Wrong arity: `ERR wrong number of arguments for 'get' command`.
 - Wrong kind of value: `WRONGTYPE Operation against a key holding the wrong kind of value`.
+- Log cannot persist (`aof` mode, write commands only): `MISCONF Sylphy is unable to persist writes to disk, so commands that may modify the data set are disabled. Check the server logs for details.`
 - Non-integer or float arguments: `ERR value is not an integer or out of range`,
   `ERR value is not a valid float`.
 
@@ -186,3 +223,6 @@ Start with cursor `0`; call again with the returned cursor until it is `0`.
 - `COMMAND COUNT` and `COMMAND DOCS` are empty-array shims.
 - Inline commands work for telnet/netcat; quoting is not supported.
 - RESP3 and `HELLO` are not supported.
+- Persistence uses Sylphy's own formats (manifest, `SYLPHYSN` snapshots, RESP log segments), not RDB. `BGSAVE` does not fork; it uses a barrier and per-shard copy-on-write inside the process.
+- `BGREWRITEAOF` and `BGSAVE` are the same checkpoint. `SAVE`, `BGSAVE` and `BGREWRITEAOF` take no arguments.
+- The `MISCONF` text is Sylphy's own, not Redis's.
