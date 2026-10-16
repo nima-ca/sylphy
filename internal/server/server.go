@@ -34,6 +34,11 @@ type Server struct {
 	ln      net.Listener
 	conns   map[*conn]struct{}
 	closing bool
+
+	// Persistence wiring, set by SetPersistence before serving.
+	persist     command.Persistence
+	prop        command.Propagator
+	waitDurable bool
 }
 
 // New creates a Server. A nil logger discards logs.
@@ -50,6 +55,17 @@ func New(cfg config.Config, st command.Store, reg *command.Registry, logger *slo
 		quit:   make(chan struct{}),
 		conns:  make(map[*conn]struct{}),
 	}
+}
+
+// SetPersistence wires persistence into connections accepted after the call;
+// call it before Serve. p backs SAVE, BGSAVE, BGREWRITEAOF and LASTSAVE (nil
+// leaves them disabled). prop, if non-nil, receives every write through a
+// per-connection journal, and with waitDurable (fsync "always") a connection's
+// replies are sent only after the writes they acknowledge are durable.
+func (s *Server) SetPersistence(p command.Persistence, prop command.Propagator, waitDurable bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.persist, s.prop, s.waitDurable = p, prop, waitDurable && prop != nil
 }
 
 // ListenAndServe listens on the configured address and serves until ctx is
@@ -239,10 +255,13 @@ func (s *Server) removeConn(c *conn) {
 	s.mu.Unlock()
 }
 
+// forceCloseAll closes every connection's socket and cancels its context, which
+// also wakes a connection that is blocked waiting for room in the log.
 func (s *Server) forceCloseAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for c := range s.conns {
 		_ = c.nc.Close()
+		c.cancel()
 	}
 }

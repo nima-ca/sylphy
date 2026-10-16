@@ -13,11 +13,14 @@
 | `internal/command`  | `Registry`, `Dispatcher`, command handlers, `Context`, `Rewrite` hooks                  |
 | `internal/server`   | TCP accept loop, per-connection loop, graceful shutdown                                 |
 | `internal/config`   | Defaults, validation, flag/env loading                                                  |
-| `cmd/sylphy-server` | Wiring, logging, signal handling, store sweeper lifecycle                               |
+| `internal/persist`  | Durability: manifest, snapshot and log formats, AOF, recovery, checkpoint manager       |
+| `cmd/sylphy-server` | Wiring, logging, signals, recovery and shutdown order, sweeper lifecycle                |
 
 Dependencies point inward: `server` → `command` → (`store` via interface, `protocol`).
 The value packages import `store` (for `Kind`, `Value`, `Collection`) and
 `command` imports them; `store` knows nothing about concrete collection types.
+`persist` imports `command` (registry, `Propagator`) and `store`. `cmd/sylphy-server`
+wires it to `server` through `command.Persistence` and `command.Propagator`.
 `command` depends on a small `Store` interface, so handlers are tested against a
 real small store with a fake clock.
 
@@ -31,7 +34,8 @@ flowchart LR
     H --> St[(store.Store<br/>N shards)]
     H --> W[protocol.Writer]
     D --> W
-    D -.->|if Propagate| RW[Rewrite hook]
+    H -.->|aof mode: append under shard lock| A[persist.AOF buffer]
+    A --> FL[AOF flusher] --> Disk[(data dir)]
     SW[expiry sweeper] --> St
     W -->|flush when reader buffer empty| C
 ```
@@ -46,11 +50,16 @@ flowchart LR
 4. The handler reads/writes the store and appends its reply to the `Writer`
    buffer. Returned `*ReplyError`s become RESP errors; `store.ErrWrongType`
    becomes `WRONGTYPE`; other errors become `ERR internal error` and are logged.
-5. If `Context.Propagate` is set and the command was a successful write,
-   `Dispatch` leaves its deterministic form in `Context.Rewritten` (see
-   [ADR-018](DESIGN_DECISIONS.md#adr-018-rewrite-hooks-for-a-future-append-only-log)).
+5. In `aof` mode a write command goes through the journal: before the handler
+   it is refused with `MISCONF` if persistence has failed, then waits for room in
+   the log (`Admit`); inside the handler's critical section its deterministic
+   form is appended to the log (see [Persistence](#persistence) and
+   [ADR-018](DESIGN_DECISIONS.md#adr-018-rewrite-hooks-for-a-future-append-only-log),
+   [ADR-020](DESIGN_DECISIONS.md#adr-020-logging-under-the-shard-lock-through-a-journaling-store)).
 6. If `Reader.Buffered() == 0` the writer is flushed — one syscall for a whole
    pipelined batch. Otherwise the loop continues with the next buffered request.
+   With `aof` and `append-fsync always` the reply to a write is held until its
+   log record is durable.
 7. Protocol/limit errors write `-ERR Protocol error: ...`, flush, and close the
    connection. `QUIT` flushes and closes.
 
@@ -102,6 +111,9 @@ Deadlines are absolute Unix milliseconds. Each shard has an `exp` index
   the real wall clock because it bounds CPU time. See
   [ADR-011](DESIGN_DECISIONS.md#adr-011-expiry-lazy-checks-plus-sampled-active-sweeping)
   and [ADR-012](DESIGN_DECISIONS.md#adr-012-injectable-clock).
+- **Persistence.** In `aof` mode a hook logs `DEL key` inside the shard lock for
+  each key that expiry removes, and recovery replays the log with the clock
+  frozen (see [ADR-022](DESIGN_DECISIONS.md#adr-022-frozen-clock-replay-and-logging-expiry-as-del)).
 
 ## Concurrency model
 
@@ -115,6 +127,17 @@ Deadlines are absolute Unix milliseconds. Each shard has an `exp` index
   The sweeper, `Scan`, `RandomKey`, `Keys` and `Flush` hold one lock at a time;
   `Keys` and `Scan` snapshot names under a shard read lock and filter outside it.
 - **Registry** is immutable after startup (lock-free reads).
+- **Persistence locks.** Lock order is shard locks (ascending, as above), then
+  the AOF mutex. Journaling appends records while shard locks are held, and so
+  does the expiry hook, which is why the AOF mutex is a leaf: `Append` only
+  copies into a memory buffer and `Rotate` only marks a boundary, and the
+  flusher does all file I/O without holding it. `Store.BeginSnapshot` is the
+  other multi-shard entry point: it takes every shard in ascending order and
+  runs the barrier (`AOF.Rotate`, `AOF.Stats`) under them. Calls that block
+  (`Admit`, `WaitDurable`) are made with no lock held. The `Manager` mutex is
+  never taken under a shard lock or the AOF mutex; the flusher holds it across
+  the manifest commit that lists a new segment, so that callback must never wait
+  for a shard lock.
 - **Shutdown**: `closing` is set under `mu` before the listener is closed;
   `admit` checks it under the same lock before `wg.Add`, so `Add` never races
   `Wait`. Draining sets a past read deadline on every connection (guarded by a
@@ -124,16 +147,21 @@ Deadlines are absolute Unix milliseconds. Each shard has an `exp` index
 
 ## Goroutine ownership
 
-| Goroutine       | Owner                     | Exits when                                                    |
-| --------------- | ------------------------- | ------------------------------------------------------------- |
-| accept loop     | `Serve` (waits on it)     | listener closed                                               |
-| connection      | `Server.wg`               | peer closes, error, drain deadline, force close               |
-| shutdown waiter | `Shutdown`                | `wg.Wait` returns                                             |
-| expiry sweeper  | `Store` (`Start`/`Close`) | `Store.Close` (waits on it); `Start` after `Close` is a no-op |
+| Goroutine          | Owner                                               | Exits when                                                                                  |
+| ------------------ | --------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| accept loop        | `Serve` (waits on it)                               | listener closed                                                                             |
+| connection         | `Server.wg`                                         | peer closes, error, drain deadline, force close                                             |
+| shutdown waiter    | `Shutdown`                                          | `wg.Wait` returns                                                                           |
+| expiry sweeper     | `Store` (`Start`/`Close`)                           | `Store.Close` (waits on it); `Start` after `Close` is a no-op                               |
+| AOF flusher        | `persist.AOF`, opened by `Manager.Start` (aof mode) | `AOF.Close`, called last by `Manager.Shutdown`; it writes and fsyncs what is buffered first |
+| checkpoint trigger | `Manager`, started by `Start` (aof mode)            | `Manager.Shutdown` closes `quit` and waits for it                                           |
+| BGSAVE worker      | `Manager.wg`                                        | it finishes, or `Manager.Shutdown` cancels it (`bgCtx`) and waits                           |
+| signal watcher     | `run` in `main`                                     | `done` is closed when `run` returns                                                         |
 
 `Store.Close` is idempotent, safe without `Start`, and leaves the store usable
 (without active expiry). Integration tests assert that no goroutine outlives the
-server and store.
+server and store. `SAVE` runs on the calling connection's goroutine and takes the
+same single checkpoint slot as `BGSAVE`; `Manager.Shutdown` cancels it too.
 
 ## SCAN
 
@@ -142,9 +170,99 @@ high to low; the cursor packs the shard and the number of unvisited slots, so
 the server keeps no iteration state. Cost per call is O(`COUNT` + shards). See
 [ADR-016](DESIGN_DECISIONS.md#adr-016-scan-cursor-over-shards-and-key-slots).
 
+## Persistence
+
+Three modes: `off` (nothing on disk), `snapshot` (checkpoints only) and `aof`
+(every write logged, plus checkpoints); see
+[ADR-027](DESIGN_DECISIONS.md#adr-027-persistence-modes). Formats, configuration
+and operations are in [PERSISTENCE.md](PERSISTENCE.md).
+
+**Write path (`aof`).**
+
+1. `journal.begin` runs before a write handler: `MISCONF` if the log has failed,
+   then `Admit` blocks, outside any lock, while the log buffer is at or above its
+   high-water mark.
+2. The handler's closure runs under its shard lock(s), passing the
+   [copy-on-write gate](#copy-on-write-gate) first.
+3. When the closure succeeds, the journal appends the command's rewrite (or the
+   request verbatim) in the same critical section. `AOF.Append` copies the
+   records into a memory buffer and assigns sequence numbers; it never blocks
+   and does no I/O. `Set`, `Delete` and `Flush` log `SET`, `DEL` (only if the key
+   existed) and `FLUSHALL` themselves.
+4. The locks are released and the reply goes to the `Writer`. `Context.LastSeq`
+   holds the newest sequence this connection appended.
+5. The AOF flusher goroutine seals what has been appended, writes it to the
+   active segment and fsyncs according to `append-fsync`. Records appended while
+   a write or fsync runs form the next batch (group commit).
+6. With `always`, the server holds a connection's replies until `WaitDurable`
+   says its records are fsynced.
+
+If `Append` fails after the command was applied (the log latched between `Admit`
+and `Append`), the change stays in memory: a closure command returns `MISCONF`
+instead of its reply and later writes are refused until a checkpoint heals the
+log ([ADR-025](DESIGN_DECISIONS.md#adr-025-admit-backpressure-and-the-error-latch)).
+
+### Copy-on-write gate
+
+Go has no `fork`, so a checkpoint takes its point-in-time copy lazily, one shard
+at a time ([ADR-021](DESIGN_DECISIONS.md#adr-021-shard-granular-copy-on-write-snapshots)).
+
+1. `Store.BeginSnapshot` locks every shard in ascending order, runs the barrier
+   (in `aof` mode the log rotation marker, an in-memory step), marks every shard
+   pending and unlocks.
+2. After that each shard is serialized once, from its state at step 1, by
+   whichever comes first: `Snapshot.Drain` walking the shards under the read
+   lock, or the first writer to take that shard's write lock. Every write-lock
+   acquisition goes through `lockW`, which serializes a pending shard before the
+   writer changes it (a test enforces that no acquisition bypasses it).
+   A writer that locks several shards gates all of them first.
+3. `Drain` hands each shard's block to the base-file writer in shard order.
+   `Snapshot.Close` ends the gating.
+
+A writer that hits a pending shard pays for that shard's serialization under its
+lock, and blocks written ahead of `Drain` are held in memory until written.
+
+### Startup and shutdown order
+
+Startup (`serve` in `main.go`):
+
+1. Load config (exit code 2 on error), build the logger, install signal handling
+   (the first signal cancels `ctx`, a second cancels `abort`).
+2. Create the store (sweeper not started), the registry and the server.
+3. With persistence on: build the `Manager` and defer its `Shutdown` (registered
+   first, so it runs last). `Recover` loads the base and replays the segments
+   with no listener and no sweeper; on failure the process exits with code 1.
+   `Start` opens the log at the recovered point, installs the expiry hook, then
+   purges keys that expired while the server was down, logging and fsyncing a
+   `DEL` for each (in `snapshot` mode the purge is in memory), and starts the
+   checkpoint trigger (`aof`). Then `SetPersistence` hands the server the
+   commands, the propagator and the hold-replies-until-durable flag
+   (`aof` and `always`).
+4. `Store.Start` starts the sweeper; `Store.Close` is deferred.
+5. Listen, then `Serve`.
+
+Shutdown runs in the opposite order:
+
+1. The first SIGINT/SIGTERM cancels `ctx`; `Serve` stops accepting and drains
+   clients within `ShutdownGracePeriod`.
+2. `Store.Close` stops the sweeper, so it never appends to a closed log.
+3. `Manager.Shutdown(abort)`: stop the checkpoint trigger, cancel and wait for a
+   running checkpoint, take the final checkpoint (when `snapshot-on-shutdown`
+   resolves to on and `abort` is not cancelled), detach the expiry hook, then
+   `AOF.Close` writes and fsyncs what is buffered (30 s limit). A failure makes
+   the exit code 1.
+4. A second signal cancels `abort`: the final checkpoint is skipped, the log is
+   still flushed and fsynced. The grace period bounds only client draining; the
+   final checkpoint is bounded only by `abort`.
+
 ## Hooks for later phases
 
-- `Spec.Rewrite`, `Context.Propagate` and `Context.Rewritten` give Phase 3 a
-  deterministic command stream (ADR-018).
-- `Context` and `ConnState` are where transaction and subscription state will go
-  in Phase 4; handlers only ever see `*Context`.
+- `Spec.Rewrite` (ADR-018) is now consumed by the
+  journal ([ADR-028](DESIGN_DECISIONS.md#adr-028-rewrite-hooks-consumed-inside-the-critical-section)).
+  `Context.EnableJournal`, `LastSeq` and `JournalErr` are the connection-side
+  surface of persistence.
+- Future work, Phase 4: transaction and subscription state goes in `Context` and
+  `ConnState`; handlers only ever see `*Context`.
+- Future work, Phase 5: replication is meant to implement `command.Propagator`,
+  the interface `*persist.AOF` implements today.
+- Future work: `INFO` can reuse `AOF.Stats`, `Manager.Err` and `LastSave`.

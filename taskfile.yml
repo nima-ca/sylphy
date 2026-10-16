@@ -41,6 +41,11 @@ tasks:
         cmds:
             - go test -race ./...
 
+    test-e2e:
+        desc: Run only the persistence end-to-end tests (builds and kills the real binary; skipped on Windows)
+        cmds:
+            - go test -count=1 -v ./test/e2e
+
     cover:
         desc: Run tests with coverage
         cmds:
@@ -54,19 +59,27 @@ tasks:
             - golangci-lint run ./...
 
     fuzz:
-        desc: Short protocol fuzz run
+        desc: Short fuzz runs (protocol reader, persistence decoders)
         cmds:
             - go test ./internal/protocol -run '^$' -fuzz FuzzReader -fuzztime 20s
+            - go test ./internal/persist -run '^$' -fuzz FuzzRecordReader -fuzztime 20s
+            - go test ./internal/persist -run '^$' -fuzz FuzzSnapshotReader -fuzztime 20s
+            - go test ./internal/persist -run '^$' -fuzz FuzzDecodeManifest -fuzztime 20s
 
     bench:
-        desc: Run all benchmarks, including the 1M-key expiry ones (takes a few minutes)
+        desc: Run all benchmarks, including the 1M-key expiry and recovery ones (takes several minutes)
         cmds:
-            - go test -run '^$' -bench . -benchmem ./internal/protocol ./internal/store ./internal/list ./internal/zset
+            - go test -timeout 30m -run '^$' -bench . -benchmem ./internal/protocol ./internal/store ./internal/list ./internal/zset ./internal/persist ./test/integration
 
     bench-short:
-        desc: Run the quick benchmarks only (skips the 1M-key expiry ones)
+        desc: Run the quick benchmarks only (skips the 1M-key and the persistence server benchmarks)
         cmds:
-            - go test -short -run '^$' -bench . -benchmem ./internal/protocol ./internal/store ./internal/list ./internal/zset
+            - go test -short -run '^$' -bench . -benchmem ./internal/protocol ./internal/store ./internal/list ./internal/zset ./internal/persist ./test/integration
+
+    bench-persist:
+        desc: Run only the persistence benchmarks (snapshot, recovery, SET throughput per fsync policy, latency during BGSAVE)
+        cmds:
+            - go test -timeout 30m -run '^$' -bench . -benchmem ./internal/persist ./test/integration
 
     docker:
         desc: Build the Docker image

@@ -1,7 +1,10 @@
 package command
 
 import (
+	"context"
+	"errors"
 	"math/rand/v2"
+	"time"
 
 	"github.com/nima-ca/sylphy/internal/config"
 	"github.com/nima-ca/sylphy/internal/protocol"
@@ -17,6 +20,11 @@ import (
 // need out of the closure and write the reply afterwards, so a slow client can
 // never stall a shard; a closure must not block, must not call back into the
 // Store, and must not retain the Values or Entries it is given.
+//
+// When persistence is on, a connection's Store is a journaling wrapper (see
+// Context.EnableJournal) that logs each write inside the closure's critical
+// section. A handler that writes must therefore record its effects in ctx.fx
+// inside the closure, before it returns, not after the Store call.
 type Store interface {
 	Get(key string) ([]byte, bool)
 	Set(key string, value []byte)
@@ -24,6 +32,9 @@ type Store interface {
 	Exists(keys ...string) int
 	Len() int
 	Flush()
+	// FlushWith empties the store while holding every shard lock and calls
+	// underLock, if non-nil, before releasing them.
+	FlushWith(underLock func())
 	Keys(pattern string) []string
 	Update(key string, fn func(old []byte, exists bool) ([]byte, error)) error
 
@@ -57,6 +68,23 @@ type Store interface {
 
 var _ Store = (*store.Store)(nil)
 
+// ErrCheckpointRunning is returned by a Persistence when a checkpoint is
+// already in progress.
+var ErrCheckpointRunning = errors.New("a checkpoint is already in progress")
+
+// Persistence is what the SAVE family of commands needs from the persistence
+// layer. A nil Persistence in the Context means persistence is off.
+type Persistence interface {
+	// Save runs a checkpoint and returns when it is committed.
+	Save(ctx context.Context) error
+	// BGSave starts a checkpoint in the background and returns at once.
+	BGSave() error
+	// LastSave returns when persistence last reached a checkpoint.
+	LastSave() time.Time
+	// AOFEnabled reports whether writes are logged to an append-only file.
+	AOFEnabled() bool
+}
+
 // Rand supplies random integers to handlers (SPOP, SRANDMEMBER, ...).
 // *rand.Rand from math/rand/v2 implements it, which is how tests inject a
 // seeded generator.
@@ -89,14 +117,17 @@ type Context struct {
 	Config *config.Config
 	// Conn is the per-connection state.
 	Conn *ConnState
+	// Persist is the persistence layer, or nil when persistence is off.
+	Persist Persistence
 	// Rand is the source of randomness; nil means the goroutine-safe
 	// top-level functions of math/rand/v2. Because a Context belongs to one
 	// connection goroutine, a non-thread-safe generator is fine here.
 	Rand Rand
 
 	// Propagate asks Dispatch to fill Rewritten after each successful write
-	// command. It is off by default so that nothing is allocated until a
-	// consumer (the Phase 3 AOF) exists.
+	// command. It predates the journal and is kept for tests; the server logs
+	// through EnableJournal, which does the same work inside the critical
+	// section where the log order is still the apply order.
 	Propagate bool
 	// Rewritten holds the deterministic commands equivalent to the last
 	// Dispatch, ready to be logged: empty for reads, failed commands and
@@ -106,8 +137,15 @@ type Context struct {
 	// the connection.
 	Rewritten [][][]byte
 
+	// LastSeq is the sequence number of the newest log record this connection
+	// appended, 0 if none. With fsync "always" the server waits for it to be
+	// durable before it sends the replies of a pipelined batch.
+	LastSeq uint64
+
 	// fx is the scratch record for the write command being executed.
 	fx Effects
+	// journal is non-nil once EnableJournal has been called.
+	journal *journal
 }
 
 // intN returns a random integer in [0, n) from ctx.Rand, or from math/rand/v2

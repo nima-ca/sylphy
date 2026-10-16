@@ -8,8 +8,9 @@ else.
 ## Running
 
 ```bash
-task bench-short   # protocol, store, list, zset; skips the 1M-key expiry benchmarks
+task bench-short   # protocol, store, list, zset, persist; skips the 1M-key and the persistence server benchmarks
 task bench         # everything (a few minutes: it builds 1M-key stores)
+task bench-persist # only the persistence benchmarks (timeout 30m)
 go test -run '^$' -bench 'Rank|Insert' -benchmem -count 5 ./internal/zset   # one family, repeated
 ```
 
@@ -33,6 +34,12 @@ cores.
 | `internal/zset`     | `PopMinAndReinsert`                       | The priority-queue pattern                                                                                |
 | `internal/list`     | `Queue`, `Stack`                          | Push/pop at steady depth                                                                                  |
 | `internal/list`     | `At`, `Range100`, `GrowAndDrain`          | Index access, range copy, ring-buffer resize and shrink                                                   |
+| `internal/persist`  | `BenchmarkSnapshotWrite`                  | Writing a base snapshot file                                                                              |
+| `internal/persist`  | `BenchmarkSnapshotRead`                   | Reading and verifying a base snapshot file                                                                |
+| `internal/persist`  | `BenchmarkRecoverSnapshotOnly`            | Startup recovery from a manifest and a base snapshot, no log                                              |
+| `internal/persist`  | `BenchmarkRecoverSnapshotAndTail`         | Recovery from a base snapshot plus replay of a log segment                                                |
+| `test/integration`  | `BenchmarkPersistSetThroughput`           | `SET` throughput against a real server per fsync policy; skipped by `-short`                              |
+| `test/integration`  | `BenchmarkPersistLatencyDuringBGSave`     | Command latency while a `BGSAVE` checkpoint runs; skipped by `-short`                                     |
 
 ## Results
 
@@ -69,6 +76,46 @@ What to look for:
 - `zset Rank` and `RangeByRank100` should grow only slowly from 1k to 100k
   members (logarithmic).
 
+## Persistence
+
+```bash
+task bench-persist
+go test -timeout 30m -run '^$' -bench 'Snapshot|Recover' -benchmem -count 5 ./internal/persist   # one family, repeated
+```
+
+Methodology:
+
+- Run on the machine and disk you will quote. Fsync cost is the disk's, so
+  record the device, file system and where the benchmark data directory lives
+  next to the results.
+- Use `-count 5` or more and compare with `benchstat`. Record dataset size
+  (keys and bytes) for the snapshot and recovery benchmarks.
+- For `PersistSetThroughput`, fill one row per sub-benchmark exactly as the
+  output names it (one per fsync policy). For `PersistLatencyDuringBGSave`,
+  copy every metric the benchmark reports.
+- Compare latency during `BGSAVE` with the same benchmark's idle numbers; the
+  barrier pause is O(shards) and writers touching a pending shard pay for its
+  serialization ([Checkpoint](PERSISTENCE.md#checkpoint)).
+
+Machine: _CPU, cores, RAM, disk, OS, Go version, date_
+
+| Benchmark                          | ns/op                        | B/op                         | allocs/op                    | Notes |
+| ---------------------------------- | ---------------------------- | ---------------------------- | ---------------------------- | ----- |
+| `SnapshotWrite`                    | TBD (run task bench-persist) | TBD (run task bench-persist) | TBD (run task bench-persist) |       |
+| `SnapshotRead`                     | TBD (run task bench-persist) | TBD (run task bench-persist) | TBD (run task bench-persist) |       |
+| `RecoverSnapshotOnly`              | TBD (run task bench-persist) | TBD (run task bench-persist) | TBD (run task bench-persist) |       |
+| `RecoverSnapshotAndTail`           | TBD (run task bench-persist) | TBD (run task bench-persist) | TBD (run task bench-persist) |       |
+| `PersistSetThroughput/<sub-bench>` | TBD (run task bench-persist) | TBD (run task bench-persist) | TBD (run task bench-persist) |       |
+| `PersistLatencyDuringBGSave`       | TBD (run task bench-persist) | TBD (run task bench-persist) | TBD (run task bench-persist) |       |
+
+What to look for:
+
+- Under `always`, throughput is bounded by fsync latency; concurrent clients
+  share one fsync through group commit, so it should rise with client count.
+- `everysec` and `no` should sit close to persistence off, apart from the
+  cost of copying records into the log buffer.
+- Recovery with a tail should cost more than snapshot-only by the replay time.
+
 ## End-to-end with redis-benchmark
 
 Start the server (`task build && ./bin/sylphy-server`), then:
@@ -94,3 +141,12 @@ record the exact command line next to any number you quote.
 | `ZADD` (random members) | 50      | 1        |            |          |
 | `SET ... EX 60`         | 50      | 1        |            |          |
 | `LPUSH` (one hot key)   | 50      | 1        |            |          |
+
+Persistence: repeat the `SET` run with the server started in each mode.
+
+| Server flags                                   | Clients | Pipeline | Requests/s                   | p50 (ms)                     |
+| ---------------------------------------------- | ------- | -------- | ---------------------------- | ---------------------------- |
+| `-persistence-mode aof -append-fsync always`   | 50      | 1        | TBD (run task bench-persist) | TBD (run task bench-persist) |
+| `-persistence-mode aof -append-fsync everysec` | 50      | 1        | TBD (run task bench-persist) | TBD (run task bench-persist) |
+| `-persistence-mode aof -append-fsync no`       | 50      | 1        | TBD (run task bench-persist) | TBD (run task bench-persist) |
+| `-persistence-mode snapshot`                   | 50      | 1        | TBD (run task bench-persist) | TBD (run task bench-persist) |

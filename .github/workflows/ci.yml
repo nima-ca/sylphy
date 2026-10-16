@@ -42,3 +42,6 @@ jobs:
               with:
                   go-version: stable
             - run: go test ./internal/protocol -run '^$' -fuzz FuzzReader -fuzztime 20s
+            - run: go test ./internal/persist -run '^$' -fuzz FuzzRecordReader -fuzztime 20s
+            - run: go test ./internal/persist -run '^$' -fuzz FuzzSnapshotReader -fuzztime 20s
+            - run: go test ./internal/persist -run '^$' -fuzz FuzzDecodeManifest -fuzztime 20s

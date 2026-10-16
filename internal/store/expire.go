@@ -24,6 +24,12 @@ import (
 //
 // Pure scans that hold only a read lock (Keys, Len, AtomicView) skip expired
 // keys without removing them, so they never block writers longer than needed.
+//
+// Every removal of an expired key (lazy, active, or PurgeExpired) calls the
+// hook installed with SetExpireHook while the shard lock is still held, so the
+// persistence layer can log a DEL at the key's own position in the log (see
+// hooks.go). A deadline that deletes a key as a command effect (EXPIREAT in the
+// past) is not an expiry and does not call the hook.
 
 // SweepConfig tunes the active expiry sweeper.
 type SweepConfig struct {
@@ -223,10 +229,12 @@ func (s *Store) sweepCycle(start int) cycleResult {
 	return res
 }
 
-// sample examines up to size expiring keys and removes the expired ones. The
-// write lock is held for at most size map operations.
+// sample examines up to size expiring keys and removes the expired ones,
+// reporting each through the expiry hook. The write lock is held for at most
+// size map operations (plus a one-time serialization if a snapshot is pending
+// on this shard).
 func (sh *shard) sample(now int64, size int) (sampled, expired int) {
-	sh.mu.Lock()
+	sh.lockW()
 	defer sh.mu.Unlock()
 	for k, at := range sh.exp {
 		if sampled == size {
@@ -235,6 +243,7 @@ func (sh *shard) sample(now int64, size int) (sampled, expired int) {
 		sampled++
 		if now > at {
 			sh.remove(k) // deleting during range is safe in Go
+			sh.st.noteExpired(k)
 			expired++
 		}
 	}

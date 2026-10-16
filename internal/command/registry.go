@@ -221,6 +221,7 @@ func NewDefaultRegistry() (*Registry, error) {
 	specs = append(specs, setSpecs()...)
 	specs = append(specs, zsetSpecs()...)
 	specs = append(specs, keySpecs()...)
+	specs = append(specs, persistSpecs()...)
 	for _, s := range specs {
 		if err := r.Register(s); err != nil {
 			return nil, err
